@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Alibaba 3DAIGC Team Authors. All rights reserved.
 import copy
-import json
 import os
 import sys
 
@@ -579,26 +578,26 @@ class Video2MotionPipeline:
         )
 
     def save_results(self, out_path, frame_ids, poses, betas, transl, K, img_wh):
-        K = K[0].cpu().numpy()
-        for i in frame_ids:
-
-            smplx_param = {}
-            smplx_param["betas"] = betas[i].tolist()
-            smplx_param["root_pose"] = poses[i, 0].tolist()
-            smplx_param["body_pose"] = poses[i, 1:22].tolist()
-            smplx_param["jaw_pose"] = poses[i, 22].tolist()
-            smplx_param["leye_pose"] = [0.0, 0.0, 0.0]
-            smplx_param["reye_pose"] = [0.0, 0.0, 0.0]
-            smplx_param["lhand_pose"] = poses[i, 25:40].tolist()
-            smplx_param["rhand_pose"] = poses[i, 40:55].tolist()
-
-            smplx_param["trans"] = transl[i].tolist()
-            smplx_param["focal"] = [float(K[0, 0]), float(K[1, 1])]
-            smplx_param["princpt"] = [float(K[0, 2]), float(K[1, 2])]
-            smplx_param["img_size_wh"] = [img_wh[0], img_wh[1]]
-            smplx_param["pad_ratio"] = self.pad_ratio
-            with open(os.path.join(out_path, f"{(i+1):05}.json"), "w") as fp:
-                json.dump(smplx_param, fp)
+        K_np = K[0].cpu().numpy()
+        ids = np.array(frame_ids, dtype=np.int64)
+        poses_sel = poses[ids]  # [N, 55, 3]
+        data = {
+            "frame_ids": (ids + 1).astype(np.int32),  # 1-indexed
+            "betas": betas[ids].astype(np.float32),                     # [N, 10]
+            "root_pose": poses_sel[:, 0].astype(np.float32),            # [N, 3]
+            "body_pose": poses_sel[:, 1:22].astype(np.float32),         # [N, 21, 3]
+            "jaw_pose": poses_sel[:, 22].astype(np.float32),            # [N, 3]
+            "leye_pose": np.zeros((len(ids), 3), dtype=np.float32),
+            "reye_pose": np.zeros((len(ids), 3), dtype=np.float32),
+            "lhand_pose": poses_sel[:, 25:40].astype(np.float32),       # [N, 15, 3]
+            "rhand_pose": poses_sel[:, 40:55].astype(np.float32),       # [N, 15, 3]
+            "trans": transl[ids].astype(np.float32),                    # [N, 3]
+            "focal": np.array([K_np[0, 0], K_np[1, 1]], dtype=np.float32),
+            "princpt": np.array([K_np[0, 2], K_np[1, 2]], dtype=np.float32),
+            "img_size_wh": np.array([img_wh[0], img_wh[1]], dtype=np.float32),
+            "pad_ratio": float(self.pad_ratio),
+        }
+        np.save(os.path.join(out_path, "smplx_params.npy"), data)
 
     def __call__(self, video_path, output_path, fps):
         start = time.time()
@@ -660,10 +659,8 @@ class Video2MotionPipeline:
                 output_folder,
             )
 
-        smplx_output_folder = os.path.join(output_folder, "smplx_params")
-        os.makedirs(smplx_output_folder, exist_ok=True)
         self.save_results(
-            smplx_output_folder,
+            output_folder,
             frame_ids,
             poses,
             betas,
