@@ -323,6 +323,7 @@ class Video2MotionPipeline:
         is_smooth=True,
         pad_ratio=0.2,
         fov=60,
+        min_track_len=None,
     ):
         self.device = device
         self.visualize = visualize
@@ -332,6 +333,7 @@ class Video2MotionPipeline:
         self.fov = fov
         self.fps = None
         self.is_smooth = is_smooth
+        self.min_track_len = min_track_len
         self.pose_model, self.keypoint_detector, self.smplx_model = load_models(
             model_path,
             self.device,
@@ -458,12 +460,16 @@ class Video2MotionPipeline:
             all_frame_results.append(target_human)
 
         # parse chunk & missed frame padding
+        min_len = self.min_track_len
+        if min_len is None:
+            min_len = int(self.fps / 10)
+
         data_chunks = parse_chunks(
             frame_ids,
             all_frame_results,
             keypoints,
             bboxes,
-            min_len=int(self.fps / 10),
+            min_len=min_len,
         )
 
         trans_cam_fill = np.zeros((video_length, 3))

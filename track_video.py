@@ -29,8 +29,7 @@ def extract_frame(video_path, out_path):
     return fps
 
 
-class VideoTracker:
-
+class BaseTracker:
     def __init__(self, model_path, device, opt):
         self.device = device
         self.model_path = model_path
@@ -38,9 +37,7 @@ class VideoTracker:
         self._init_models(model_path)
 
     def _init_models(self, model_path):
-
         self.sam2seg = init_box_model(model_path)
-
         self.video2motion = Video2MotionPipeline(
             os.path.join(model_path, "human_model_files"),
             device=self.device,
@@ -52,6 +49,26 @@ class VideoTracker:
         self.gaga_track = init_gaga_track(
             os.path.join(model_path, "gagatracker"), self.device
         )
+
+    def run_common_stages(self, work_dir, output_root, fps, with_flame=True):
+        # 2. predict human bbox for first frame
+        predict_box(self.sam2seg, work_dir)
+
+        # 3. human tracking and segmentation
+        run_samurai(self.model_path, work_dir)
+
+        # 4. predict 2D keypoints
+        run_sapiens(self.model_path, work_dir)
+
+        # 5. predict smplx
+        self.video2motion(work_dir, output_root, fps)
+
+        # 6. predict flame
+        if with_flame:
+            estimate_flame(self.gaga_track, work_dir)
+
+
+class VideoTracker(BaseTracker):
 
     def __call__(self, input_path, output_path):
         os.makedirs(output_path, exist_ok=True)
@@ -87,20 +104,7 @@ class VideoTracker:
         frame_path = os.path.join(output_path, "imgs_png")
         fps = extract_frame(video_path, frame_path)
 
-        # 2. predict human bbox for first frame
-        predict_box(self.sam2seg, output_path)
-
-        # 3. human tracking and segmentation
-        run_samurai(self.model_path, output_path)
-
-        # 4. predict 2D keypoints
-        run_sapiens(self.model_path, output_path)
-
-        # 5. predict smplx
-        self.video2motion(output_path, output_dir, fps)
-
-        # 6. predict flame
-        estimate_flame(self.gaga_track, output_path)
+        self.run_common_stages(output_path, output_dir, fps, with_flame=True)
         print(f"Finish processing video: {video_path}")
 
 
