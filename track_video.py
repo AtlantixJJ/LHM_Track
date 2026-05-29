@@ -11,7 +11,7 @@ from engine.pose_estimation.video2motion import Video2MotionPipeline
 from engine.predict_box import init_box_model, predict_box
 from engine.predict_flame import estimate_flame, init_gaga_track
 from engine.predict_samurai import run_samurai
-from engine.predict_sapiens_pose import run_sapiens
+from engine.predict_sapiens_pose import cleanup_sapiens_json, run_sapiens
 
 
 def extract_frame(video_path, out_path):
@@ -48,6 +48,7 @@ class VideoTracker:
             track_mode="samurai",
             is_smooth=False,
             pad_ratio=self.opt.pad_ratio,
+            visualize=self.opt.save_visualization,
         )
         self.gaga_track = init_gaga_track(
             os.path.join(model_path, "gagatracker"), self.device
@@ -82,6 +83,7 @@ class VideoTracker:
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         output_path = os.path.join(output_dir, video_name)
         os.makedirs(output_path, exist_ok=True)
+        vis = self.opt.save_visualization
 
         # 1. extract frames
         frame_path = os.path.join(output_path, "imgs_png")
@@ -91,16 +93,19 @@ class VideoTracker:
         predict_box(self.sam2seg, output_path)
 
         # 3. human tracking and segmentation
-        run_samurai(self.model_path, output_path)
+        run_samurai(self.model_path, output_path, visualize=vis)
 
         # 4. predict 2D keypoints
-        run_sapiens(self.model_path, output_path)
+        run_sapiens(self.model_path, output_path, visualize=vis)
 
         # 5. predict smplx
         self.video2motion(output_path, output_dir, fps)
 
-        # 6. predict flame
-        estimate_flame(self.gaga_track, output_path)
+        # 6. predict flame (reads sapiens JSONs directly)
+        estimate_flame(self.gaga_track, output_path, visualize=vis)
+
+        # 7. clean up sapiens JSONs now that all consumers are done
+        cleanup_sapiens_json(output_path)
         print(f"Finish processing video: {video_path}")
 
 
@@ -126,6 +131,11 @@ def get_parse():
         type=float,
         default=0.2,
         help="padding images for more accurate estimation results",
+    )
+    parser.add_argument(
+        "--save_visualization",
+        action="store_true",
+        help="save visualization videos and images (off by default)",
     )
     args = parser.parse_args()
     return args

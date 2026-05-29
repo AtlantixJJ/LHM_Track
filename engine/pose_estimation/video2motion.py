@@ -77,17 +77,20 @@ def load_frames(video_path, pad_ratio=0.2):
 
 
 def load_keypoint_sapiens(sapiens_kp_path, frame_ids):
+    npy_path = os.path.join(sapiens_kp_path, "sapiens_pose.npy")
+    data = np.load(npy_path, allow_pickle=True).item()
+    # build frame_id → row index lookup (data["frame_ids"] are 1-indexed)
+    id_to_idx = {int(fid): i for i, fid in enumerate(data["frame_ids"])}
     all_keypoints = []
     for frame_id in frame_ids:
-        img_path = os.path.join(sapiens_kp_path, f"{(frame_id+1):05d}.json")
-        with open(img_path, "rb") as f:
-            data = json.load(f)["instance_info"]
-            keypoints = np.array(data[0]["keypoints"])
-            score = np.array(data[0]["keypoint_scores"])
-        keypoints = np.concatenate((keypoints, score[:, None]), axis=1)
-        all_keypoints.append(keypoints)
-
-    return np.stack(all_keypoints, axis=0)
+        idx = id_to_idx.get(frame_id + 1)  # frame_ids here are 0-indexed
+        if idx is None:
+            all_keypoints.append(np.zeros((133, 3), dtype=np.float32))
+        else:
+            kpts = data["keypoints"][idx]         # [133, 2]
+            scores = data["keypoint_scores"][idx]  # [133]
+            all_keypoints.append(np.concatenate([kpts, scores[:, None]], axis=1))
+    return np.stack(all_keypoints, axis=0)  # [N, 133, 3]
 
 
 def images_crop(images, bboxes, target_size, device=torch.device("cuda")):
@@ -318,7 +321,7 @@ class Video2MotionPipeline:
         device,
         kp_mode="vitpose",
         track_mode="yolo",
-        visualize=True,
+        visualize=False,
         is_smooth=True,
         pad_ratio=0.2,
         fov=60,

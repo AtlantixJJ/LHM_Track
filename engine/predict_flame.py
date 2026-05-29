@@ -49,12 +49,12 @@ def save_flame_to_npy(flame_results, out_path):
     np.save(join(out_path, "flame_params.npy"), data)
 
 
-def estimate_flame(gagatrack, video_dir):
+def estimate_flame(gagatrack, video_dir, visualize=False):
     tmp_path = join(video_dir, "flame_params")
     os.makedirs(tmp_path, exist_ok=True)
 
     try:
-        optim_results = gagatrack.track_video(video_dir, tmp_path)
+        optim_results = gagatrack.track_video(video_dir, tmp_path, no_vis=not visualize)
 
         if len(optim_results) > 0:
             save_flame_to_npy(optim_results, video_dir)

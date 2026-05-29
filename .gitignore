@@ -50,6 +50,7 @@ Thumbs.db
 *.swp
 *.swo
 *.~*
+*.mp4
 
 # User Setting
 debug/

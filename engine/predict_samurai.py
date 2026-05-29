@@ -7,11 +7,8 @@ import os
 SAMURAI = "./engine/samurai/"
 
 
-def run_samurai(model_path, output_path):
+def run_samurai(model_path, output_path, visualize=False):
     # warnings.simplefilter("ignore", category=UserWarning, lineno=0, append=False)
-    cmd = "python ./scripts/demo.py --video_path {} \
-        --txt_path {} \
-            --model_path {} --output {} --video_output_path {} --save_img"
     model_path = os.path.join(model_path, "sam2/sam2.1_hiera_large.pt")
 
     model_path = os.path.abspath(model_path)
@@ -26,15 +23,14 @@ def run_samurai(model_path, output_path):
     assert os.path.exists(img_path) and os.path.exists(txt_path), print(img_path)
 
     output = os.path.join(output_dir, "samurai_seg")
-    save_mp4 = os.path.join(output_dir, "samurai_visualize.mp4")
     try:
-        cur_cmd = cmd.format(
-            img_path,
-            txt_path,
-            model_path,
-            output,
-            save_mp4,
-        )
+        if visualize:
+            save_mp4 = os.path.join(output_dir, "samurai_visualize.mp4")
+            cmd = "python ./scripts/demo.py --video_path {} --txt_path {} --model_path {} --output {} --video_output_path {} --save_img"
+            cur_cmd = cmd.format(img_path, txt_path, model_path, output, save_mp4)
+        else:
+            cmd = "python ./scripts/demo.py --video_path {} --txt_path {} --model_path {} --output {} --save_img"
+            cur_cmd = cmd.format(img_path, txt_path, model_path, output)
         os.system(cur_cmd)
     finally:
         os.chdir(cur_path)
