@@ -137,7 +137,10 @@ class SMPLifyLoss(torch.nn.Module):
         ).mean()
 
         # Loss 3. Shape prior and consistency error
-        consistency_error = shape.std(dim=0).mean()
+        if shape.shape[0] > 1:
+            consistency_error = shape.std(dim=0).mean()
+        else:
+            consistency_error = 0.0
 
         sprior_error = torch.linalg.norm(shape, dim=-1).mean()
         shape_error = (
@@ -314,6 +317,7 @@ class TemporalSMPLify:
             cam_intrinsics=cam_intrinsic,
             device=self.device,
             j3d_idx=self.first_fitting_src_idx,
+            is_smooth=self.is_smooth,
         )
 
         for j in (j_bar := tqdm(range(30))):
@@ -337,6 +341,7 @@ class TemporalSMPLify:
             init_pose=init_poses_,
             device=self.device,
             j3d_idx=self.src_idx,
+            is_smooth=self.is_smooth,
         )
 
         optimizer = torch.optim.Adam(params, lr=lr)

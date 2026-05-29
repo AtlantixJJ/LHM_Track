@@ -2,6 +2,7 @@
 import sys
 
 sys.path.append("./")
+sys.path.append("./engine")
 sys.path.append("./gaga_track")
 import os
 import shutil
