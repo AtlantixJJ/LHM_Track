@@ -60,20 +60,29 @@ def run_sapiens(model_path, output_dir, visualize=False):
         model_path,
         "sapiens/poses/sapiens_1b_coco_wholebody_best_coco_wholebody_AP_727_torchscript.pt2",
     )
-    img_path = os.path.join(output_dir, "imgs_png")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Sapiens pose model not found: {model_path}\n"
+            "Download LHM_track_model.tar and extract into pretrained_models/."
+        )
 
+    img_path = os.path.join(output_dir, "imgs_png")
     output_path = os.path.join(output_dir, "sapiens_pose")
 
-    cmd = f"python ./engine/sapiens_api/core/vis_pose.py \
-            {model_path} \
-            --num_keypoints 133 \
-            --batch-size 1 \
-            --input {img_path} \
-            --output-root={output_path} \
-            --radius 6 \
-            --kpt-thr 0.3"
+    cmd = (
+        f"python ./engine/sapiens_api/core/vis_pose.py"
+        f" {model_path}"
+        f" --num_keypoints 133"
+        f" --batch-size 1"
+        f" --input {img_path}"
+        f" --output-root={output_path}"
+        f" --radius 6"
+        f" --kpt-thr 0.3"
+    )
+    ret = os.system(cmd)
+    if ret != 0:
+        raise RuntimeError(f"run_sapiens failed with exit code {ret}: {cmd}")
 
-    os.system(cmd)
     # Keep JSONs alive: gaga_track reads them directly during flame estimation.
     # Call cleanup_sapiens_json after flame estimation completes.
     consolidate_sapiens_pose(output_path, delete_json=False, delete_png=not visualize)

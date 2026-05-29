@@ -31,6 +31,8 @@ def run_samurai(model_path, output_path, visualize=False):
         else:
             cmd = "python ./scripts/demo.py --video_path {} --txt_path {} --model_path {} --output {} --save_img"
             cur_cmd = cmd.format(img_path, txt_path, model_path, output)
-        os.system(cur_cmd)
+        ret = os.system(cur_cmd)
+        if ret != 0:
+            raise RuntimeError(f"run_samurai failed with exit code {ret}: {cur_cmd}")
     finally:
         os.chdir(cur_path)
