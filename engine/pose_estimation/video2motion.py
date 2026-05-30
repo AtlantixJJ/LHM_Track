@@ -636,16 +636,19 @@ class Video2MotionPipeline:
 
     def save_results(self, out_path, frame_ids, poses, betas, transl, K, img_wh):
         K_np = K[0].cpu().numpy()
-        ids = np.array(frame_ids, dtype=np.int64)
-        poses_sel = poses[ids]  # [N, 55, 3]
+        # Save ALL video frames (0-indexed), not just SAMURAI-tracked ones.
+        # poses/betas/transl are video_length-long arrays; untracked frames stay zero.
+        video_length = poses.shape[0]
+        ids = np.arange(video_length, dtype=np.int64)
+        poses_sel = poses[ids]  # [video_length, 55, 3]
         data = {
             "frame_ids": (ids + 1).astype(np.int32),  # 1-indexed
             "betas": betas[ids].astype(np.float32),                     # [N, 10]
             "root_pose": poses_sel[:, 0].astype(np.float32),            # [N, 3]
             "body_pose": poses_sel[:, 1:22].astype(np.float32),         # [N, 21, 3]
             "jaw_pose": poses_sel[:, 22].astype(np.float32),            # [N, 3]
-            "leye_pose": np.zeros((len(ids), 3), dtype=np.float32),
-            "reye_pose": np.zeros((len(ids), 3), dtype=np.float32),
+            "leye_pose": np.zeros((video_length, 3), dtype=np.float32),
+            "reye_pose": np.zeros((video_length, 3), dtype=np.float32),
             "lhand_pose": poses_sel[:, 25:40].astype(np.float32),       # [N, 15, 3]
             "rhand_pose": poses_sel[:, 40:55].astype(np.float32),       # [N, 15, 3]
             "trans": transl[ids].astype(np.float32),                    # [N, 3]
