@@ -1,6 +1,8 @@
 import json
 import os
+import shutil
 import sys
+import tempfile
 
 import numpy as np
 
@@ -94,3 +96,78 @@ def cleanup_sapiens_json(output_dir):
     for fname in os.listdir(sapiens_dir):
         if fname.endswith(".json"):
             os.remove(os.path.join(sapiens_dir, fname))
+
+
+def run_sapiens_batch(model_path, work_dirs, img_paths=None, seg_paths=None, visualize=False):
+    """Run sapiens pose estimation on all work_dirs in a single subprocess.
+
+    Images and masks are collected into a temporary flat directory.
+    When img_paths / seg_paths are provided they are used directly (no workspace
+    copy needed); otherwise falls back to work_dir/imgs_png/ and samurai_seg/.
+    Outputs are redistributed to each work_dir's ``sapiens_pose/`` folder.
+    """
+    model_full = os.path.join(
+        model_path,
+        "sapiens/poses/sapiens_1b_coco_wholebody_best_coco_wholebody_AP_727_torchscript.pt2",
+    )
+    if not os.path.exists(model_full):
+        raise FileNotFoundError(
+            f"Sapiens pose model not found: {model_full}\n"
+            "Download LHM_track_model.tar and extract into pretrained_models/."
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        imgs_dir = os.path.join(tmp, "imgs_png")
+        segs_dir = os.path.join(tmp, "samurai_seg")
+        out_dir = os.path.join(tmp, "sapiens_output")
+        os.makedirs(imgs_dir)
+        os.makedirs(segs_dir)
+        os.makedirs(out_dir)
+
+        valid = []
+        for idx, work_dir in enumerate(work_dirs):
+            src_img = (
+                img_paths[idx] if img_paths is not None
+                else os.path.join(work_dir, "imgs_png", "00001.png")
+            )
+            if not os.path.exists(src_img):
+                print(f"[WARN] sapiens_batch: image not found, skipping: {src_img}")
+                continue
+            name = f"{idx:04d}_00001.png"
+            os.symlink(os.path.abspath(src_img), os.path.join(imgs_dir, name))
+
+            src_seg = (
+                seg_paths[idx] if seg_paths is not None
+                else os.path.join(work_dir, "samurai_seg", "00001.png")
+            )
+            if src_seg and os.path.exists(src_seg):
+                os.symlink(os.path.abspath(src_seg), os.path.join(segs_dir, name))
+
+            valid.append((idx, work_dir))
+
+        if not valid:
+            return
+
+        cmd = (
+            f"python ./engine/sapiens_api/core/vis_pose.py"
+            f" {model_full}"
+            f" --num_keypoints 133"
+            f" --batch-size 1"
+            f" --input {imgs_dir}"
+            f" --output-root={out_dir}"
+            f" --radius 6"
+            f" --kpt-thr 0.3"
+        )
+        ret = os.system(cmd)
+        if ret != 0:
+            raise RuntimeError(f"run_sapiens_batch failed with exit code {ret}: {cmd}")
+
+        for idx, work_dir in valid:
+            src_json = os.path.join(out_dir, f"{idx:04d}_00001.json")
+            if not os.path.exists(src_json):
+                print(f"[WARN] sapiens_batch: no output json for {work_dir}")
+                continue
+            sap_dir = os.path.join(work_dir, "sapiens_pose")
+            os.makedirs(sap_dir, exist_ok=True)
+            shutil.copy2(src_json, os.path.join(sap_dir, "00001.json"))
+            consolidate_sapiens_pose(sap_dir, delete_json=False, delete_png=not visualize)

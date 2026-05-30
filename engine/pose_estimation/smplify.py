@@ -16,6 +16,7 @@ KEYPOINT_THRESH = 0.5
 ROOT_ORIENT_JITTER_THRESH = 1.0
 
 
+
 def gmof(x, sigma):
     """
     Geman-McClure error function
@@ -63,10 +64,18 @@ class FastFirstFittingLoss(torch.nn.Module):
         scale = bbox[..., -1:].unsqueeze(-1)
         pred_keypoints = j2d[..., self.j3d_idx, :]
         mask = input_keypoints[..., -1:] > KEYPOINT_THRESH
-        valid_mask = torch.sum(mask, dim=1) > 3
+        valid_mask = torch.sum(mask, dim=1) >= 2
         valid_mask = valid_mask[:, 0]
 
         mask[~valid_mask] = False
+        valid_count = mask.sum()
+        if valid_count == 0:
+            scores = input_keypoints[..., -1].detach().cpu()
+            raise ValueError(
+                "Not enough valid orientation keypoints for first SMPLify stage "
+                f"(threshold={KEYPOINT_THRESH}, scores={scores.tolist()})"
+            )
+
         joints_conf = input_keypoints[..., -1:]
         joints_conf[~mask] = 0.0
 
@@ -74,7 +83,7 @@ class FastFirstFittingLoss(torch.nn.Module):
             (pred_keypoints - input_keypoints[..., :-1]) ** 2 * joints_conf
         ) / scale
 
-        reprojection_error = reprojection_error.sum() / mask.sum()
+        reprojection_error = reprojection_error.sum() / valid_count
         if self.is_smooth:
             dist_diff = compute_jitter(transl).mean()
             pose_diff = compute_jitter(root_orient).mean()
@@ -239,7 +248,6 @@ class TemporalSMPLify:
         keypoints_2d,
         bbox,
     ):
-
         def to_params(param):
             return param.detach().clone().requires_grad_(True)
 
@@ -322,6 +330,8 @@ class TemporalSMPLify:
 
         for j in (j_bar := tqdm(range(30))):
             loss = first_step_loss(params[0], params[3], j3d, k2d_orient_fitting, bbox)
+            if not torch.isfinite(loss):
+                raise ValueError(f"Non-finite first-stage SMPLify loss at step {j}")
             optimizer.zero_grad()
 
             loss.backward()
@@ -352,6 +362,8 @@ class TemporalSMPLify:
         for j in (j_bar := tqdm(range(self.num_steps))):
             optimizer.zero_grad()
             loss = optimizer.step(closure)
+            if not torch.isfinite(loss):
+                raise ValueError(f"Non-finite second-stage SMPLify loss at step {j}")
             msg = f"Loss: {loss.item():.1f}"
             j_bar.set_postfix_str(msg)
 

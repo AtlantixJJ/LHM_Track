@@ -24,8 +24,8 @@ def init_box_model(model_path):
     return model
 
 
-def predict_box(model, output_path):
-    img = os.path.join(output_path, "imgs_png/00001.png")
+def predict_box(model, output_path, img_path=None):
+    img = img_path if img_path is not None else os.path.join(output_path, "imgs_png/00001.png")
     out = model(img_path=img, bbox=None)
     str_result = ",".join(map(str, out.xywh))
 

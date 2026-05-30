@@ -51,12 +51,13 @@ class BaseTracker:
             os.path.join(model_path, "gagatracker"), self.device
         )
 
-    def run_common_stages(self, work_dir, output_root, fps, with_flame=True, visualize=False):
+    def run_common_stages(self, work_dir, output_root, fps, with_flame=True, visualize=False, skip_samurai=False):
         # 2. predict human bbox for first frame
         predict_box(self.sam2seg, work_dir)
 
         # 3. human tracking and segmentation
-        run_samurai(self.model_path, work_dir, visualize=False)
+        if not skip_samurai:
+            run_samurai(self.model_path, work_dir, visualize=False)
 
         # 4. predict 2D keypoints
         run_sapiens(self.model_path, work_dir, visualize=visualize)
