@@ -317,7 +317,7 @@ class RendererUtil():
     def render_video(self, results, pil_bis_frames, fps, out_path):
         writer = imageio.get_writer(
              out_path,
-             fps=fps, mode='I', format='FFMPEG', macro_block_size=1
+             fps=fps, mode='I', format='FFMPEG', macro_block_size=2
         )
         for i, humans in enumerate(tqdm(results)):
             pred_rend_array = pil_bis_frames[i]
@@ -365,7 +365,7 @@ def render_video(results, faces, K, pil_bis_frames, fps, out_path, device, keep_
     
     writer = imageio.get_writer(
              out_path,
-             fps=fps, mode='I', format='FFMPEG', macro_block_size=1
+             fps=fps, mode='I', format='FFMPEG', macro_block_size=2
         )
     for i, humans in enumerate(tqdm(results)):
         pred_rend_array = pil_bis_frames[i]
