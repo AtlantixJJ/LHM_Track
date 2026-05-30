@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import traceback
 
+import imageio_ffmpeg
 import numpy as np
 import torch
 import yaml
@@ -210,7 +211,8 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
             try:
                 subprocess.run(
                     [
-                        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                        imageio_ffmpeg.get_ffmpeg_exe(),
+                        "-y", "-f", "concat", "-safe", "0",
                         "-i", concat_list, "-c", "copy", out_video,
                     ],
                     check=True,
@@ -293,16 +295,22 @@ def run_batch(tracker, opt):
                 print(f"  [SKIP] {subj_key} (already done)")
                 continue
 
-            input_images = val_list["items"][subj_key]["input_images"]
+            subj_item = val_list["items"][subj_key]
+            input_images = subj_item.get("input_images", [])
+            extra_images = subj_item.get("images", [])
+            seen = set(input_images)
+            all_images = list(input_images) + [img for img in extra_images if img not in seen]
+            n_extra = len(all_images) - len(input_images)
             print(
                 f"  Subject [{ds_subj_idx+1}/{len(subjects)}] {subj_key}"
-                f"  images={len(input_images)}  visualize={visualize}"
+                f"  images={len(all_images)} (input={len(input_images)} extra={n_extra})"
+                f"  visualize={visualize}"
                 + (f"  rank={opt.rank}/{opt.n_rank}" if opt.n_rank > 1 else "")
             )
 
             try:
                 n_done = process_subject(
-                    tracker, subj_key, input_images, data_root,
+                    tracker, subj_key, all_images, data_root,
                     subject_output, visualize,
                 )
                 print(f"  Done: {n_done}/{len(input_images)} images")
