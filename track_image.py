@@ -5,10 +5,6 @@ import json
 import os
 import pickle
 import shutil
-import subprocess
-import traceback
-
-import imageio_ffmpeg
 import numpy as np
 import torch
 import yaml
@@ -19,6 +15,7 @@ from engine.predict_flame import init_gaga_track
 from track_image_utils import (
     assert_valid_image_path,
     image_stem,
+    prepare_image_sequence_workspace,
     prepare_single_image_workspace,
 )
 from track_video import BaseTracker
@@ -56,6 +53,21 @@ class ImageTracker(BaseTracker):
             fps=1,
             with_flame=self.opt.with_flame,
             visualize=self.opt.visualize,
+        )
+        return work_dir
+
+    def process_image_sequence_visualization(self, image_paths, output_root):
+        work_dir = prepare_image_sequence_workspace(
+            image_paths,
+            output_root,
+            overwrite=True,
+        )
+        self.run_common_stages(
+            work_dir,
+            output_root,
+            fps=1,
+            with_flame=False,
+            visualize=True,
         )
         return work_dir
 
@@ -112,7 +124,7 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
           flame_params.pkl      {img_rel -> flame_dict}  (only when --with_flame)
           bbox.pkl              {img_rel -> bbox_str}
           samurai_seg/          <img_rel sanitized>.png
-          viz/                  <img_rel sanitized>.mp4  (only when visualize=True)
+          pose_visualized.mp4   subject-level visualization (when visualize=True)
 
     Each image is processed in an isolated temp dir ``_img_{idx:04d}/`` under
     ``subject_output`` so that stem collisions across views cannot occur.
@@ -123,7 +135,7 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
     flame_params = {}
     bboxes = {}
     tmp_roots = []
-    viz_clips = []  # ordered per-image clip paths for final concatenation
+    processed_image_paths = []
 
     for img_idx, img_rel in enumerate(input_images):
         img_path = os.path.join(data_root, img_rel)
@@ -137,12 +149,9 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
         tmp_roots.append(tmp_root)
 
         print(f"    [{img_idx+1}/{len(input_images)}] {img_rel}")
-        try:
-            work_dir = tracker.process_image(img_path, tmp_root)
-        except Exception:
-            print(f"    [ERROR] failed on {img_rel}")
-            traceback.print_exc()
-            continue
+        tracker.set_visualize(False)
+        work_dir = tracker.process_image(img_path, tmp_root)
+        processed_image_paths.append(img_path)
 
         # collect results
         smplx = _load_smplx(work_dir)
@@ -169,14 +178,6 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
             key_name = img_rel.replace("/", "_").replace(os.sep, "_")
             shutil.copy2(seg_src, os.path.join(seg_dir, f"{key_name}.png"))
 
-        # stage visualization clip for later concatenation
-        if visualize:
-            viz_src = os.path.join(work_dir, "pose_visualized.mp4")
-            if os.path.exists(viz_src):
-                clip_path = os.path.join(subject_output, f"_viz_clip_{img_idx:04d}.mp4")
-                shutil.move(viz_src, clip_path)
-                viz_clips.append(clip_path)
-
     # save aggregated results
     if smplx_params:
         with open(os.path.join(subject_output, "smplx_params.pkl"), "wb") as f:
@@ -198,33 +199,16 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
         if os.path.isdir(tmp_root):
             shutil.rmtree(tmp_root)
 
-    # concatenate all per-image clips into one subject-level video
-    if viz_clips:
-        out_video = os.path.join(subject_output, "visualization.mp4")
-        if len(viz_clips) == 1:
-            shutil.move(viz_clips[0], out_video)
-        else:
-            concat_list = os.path.join(subject_output, "_viz_concat.txt")
-            with open(concat_list, "w") as f:
-                for clip in viz_clips:
-                    f.write(f"file '{os.path.abspath(clip)}'\n")
-            try:
-                subprocess.run(
-                    [
-                        imageio_ffmpeg.get_ffmpeg_exe(),
-                        "-y", "-f", "concat", "-safe", "0",
-                        "-i", concat_list, "-c", "copy", out_video,
-                    ],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            finally:
-                os.remove(concat_list)
-                for clip in viz_clips:
-                    if os.path.exists(clip):
-                        os.remove(clip)
-        print(f"  Visualization: {out_video}")
+    if visualize and processed_image_paths:
+        tracker.set_visualize(True)
+        viz_work_dir = tracker.process_image_sequence_visualization(
+            processed_image_paths,
+            subject_output,
+        )
+        viz_src = os.path.join(viz_work_dir, "pose_visualized.mp4")
+        if os.path.exists(viz_src):
+            shutil.move(viz_src, os.path.join(subject_output, "pose_visualized.mp4"))
+        shutil.rmtree(viz_work_dir)
 
     return len(smplx_params)
 
@@ -308,15 +292,11 @@ def run_batch(tracker, opt):
                 + (f"  rank={opt.rank}/{opt.n_rank}" if opt.n_rank > 1 else "")
             )
 
-            try:
-                n_done = process_subject(
-                    tracker, subj_key, all_images, data_root,
-                    subject_output, visualize,
-                )
-                print(f"  Done: {n_done}/{len(input_images)} images")
-            except Exception:
-                print(f"  [ERROR] subject {subj_key}")
-                traceback.print_exc()
+            n_done = process_subject(
+                tracker, subj_key, all_images, data_root,
+                subject_output, visualize,
+            )
+            print(f"  Done: {n_done}/{len(input_images)} images")
 
 
 # ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ class BaseTracker:
         predict_box(self.sam2seg, work_dir)
 
         # 3. human tracking and segmentation
-        run_samurai(self.model_path, work_dir, visualize=visualize)
+        run_samurai(self.model_path, work_dir, visualize=False)
 
         # 4. predict 2D keypoints
         run_sapiens(self.model_path, work_dir, visualize=visualize)
