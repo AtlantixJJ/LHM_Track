@@ -5,20 +5,21 @@ import json
 import os
 import pickle
 import shutil
-import subprocess
-import traceback
-
-import imageio_ffmpeg
 import numpy as np
 import torch
 import yaml
 
+from dataclasses import dataclass
+
 from engine.pose_estimation.video2motion import Video2MotionPipeline
-from engine.predict_box import init_box_model
-from engine.predict_flame import init_gaga_track
+from engine.predict_box import init_box_model, predict_box
+from engine.predict_flame import estimate_flame, init_gaga_track
+from engine.predict_samurai import run_samurai
+from engine.predict_sapiens_pose import run_sapiens_batch
 from track_image_utils import (
     assert_valid_image_path,
     image_stem,
+    prepare_image_sequence_workspace,
     prepare_single_image_workspace,
 )
 from track_video import BaseTracker
@@ -45,18 +46,45 @@ class ImageTracker(BaseTracker):
         else:
             self.gaga_track = None
 
-    def process_image(self, image_path, output_root):
-        """Run full pipeline on one image; returns the work_dir path."""
+    def process_image(self, image_path, output_root, mask_path=None):
+        """Run full pipeline on one image; returns the work_dir path.
+
+        If *mask_path* points to an existing file it is used as the segmentation
+        mask (copied to ``samurai_seg/00001.png``) and the Samurai tracking step
+        is skipped.
+        """
         assert_valid_image_path(image_path)
         work_dir = prepare_single_image_workspace(
             image_path, output_root, overwrite=True
         )
+        skip_samurai = False
+        if mask_path and os.path.exists(mask_path):
+            seg_dir = os.path.join(work_dir, "samurai_seg")
+            os.makedirs(seg_dir, exist_ok=True)
+            shutil.copy2(mask_path, os.path.join(seg_dir, "00001.png"))
+            skip_samurai = True
         self.run_common_stages(
             work_dir,
             output_root,
             fps=1,
             with_flame=self.opt.with_flame,
             visualize=self.opt.visualize,
+            skip_samurai=skip_samurai,
+        )
+        return work_dir
+
+    def process_image_sequence_visualization(self, image_paths, output_root):
+        work_dir = prepare_image_sequence_workspace(
+            image_paths,
+            output_root,
+            overwrite=True,
+        )
+        self.run_common_stages(
+            work_dir,
+            output_root,
+            fps=1,
+            with_flame=False,
+            visualize=True,
         )
         return work_dir
 
@@ -113,7 +141,7 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
           flame_params.pkl      {img_rel -> flame_dict}  (only when --with_flame)
           bbox.pkl              {img_rel -> bbox_str}
           samurai_seg/          <img_rel sanitized>.png
-          viz/                  <img_rel sanitized>.mp4  (only when visualize=True)
+          pose_visualized.mp4   subject-level visualization (when visualize=True)
 
     Each image is processed in an isolated temp dir ``_img_{idx:04d}/`` under
     ``subject_output`` so that stem collisions across views cannot occur.
@@ -124,7 +152,7 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
     flame_params = {}
     bboxes = {}
     tmp_roots = []
-    viz_clips = []  # ordered per-image clip paths for final concatenation
+    processed_image_paths = []
 
     for img_idx, img_rel in enumerate(input_images):
         img_path = os.path.join(data_root, img_rel)
@@ -137,13 +165,14 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
         os.makedirs(tmp_root, exist_ok=True)
         tmp_roots.append(tmp_root)
 
-        print(f"    [{img_idx+1}/{len(input_images)}] {img_rel}")
-        try:
-            work_dir = tracker.process_image(img_path, tmp_root)
-        except Exception:
-            print(f"    [ERROR] failed on {img_rel}")
-            traceback.print_exc()
-            continue
+        mask_path = img_path.replace("/input_images/", "/input_masks/").replace("/images/", "/masks/")
+        if mask_path == img_path:
+            mask_path = None
+
+        print(f"    [{img_idx+1}/{len(input_images)}] {img_rel}" + (" [mask]" if mask_path and os.path.exists(mask_path) else ""))
+        tracker.set_visualize(False)
+        work_dir = tracker.process_image(img_path, tmp_root, mask_path=mask_path)
+        processed_image_paths.append(img_path)
 
         # collect results
         smplx = _load_smplx(work_dir)
@@ -170,14 +199,6 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
             key_name = img_rel.replace("/", "_").replace(os.sep, "_")
             shutil.copy2(seg_src, os.path.join(seg_dir, f"{key_name}.png"))
 
-        # stage visualization clip for later concatenation
-        if visualize:
-            viz_src = os.path.join(work_dir, "pose_visualized.mp4")
-            if os.path.exists(viz_src):
-                clip_path = os.path.join(subject_output, f"_viz_clip_{img_idx:04d}.mp4")
-                shutil.move(viz_src, clip_path)
-                viz_clips.append(clip_path)
-
     # save aggregated results
     if smplx_params:
         with open(os.path.join(subject_output, "smplx_params.pkl"), "wb") as f:
@@ -199,33 +220,207 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
         if os.path.isdir(tmp_root):
             shutil.rmtree(tmp_root)
 
-    # concatenate all per-image clips into one subject-level video
-    if viz_clips:
-        out_video = os.path.join(subject_output, "visualization.mp4")
-        if len(viz_clips) == 1:
-            shutil.move(viz_clips[0], out_video)
+    if visualize and processed_image_paths:
+        tracker.set_visualize(True)
+        viz_work_dir = tracker.process_image_sequence_visualization(
+            processed_image_paths,
+            subject_output,
+        )
+        viz_src = os.path.join(viz_work_dir, "pose_visualized.mp4")
+        if os.path.exists(viz_src):
+            shutil.move(viz_src, os.path.join(subject_output, "pose_visualized.mp4"))
+        shutil.rmtree(viz_work_dir)
+
+    return len(smplx_params)
+
+
+def process_subject_visualization(tracker, input_images, data_root, subject_output):
+    image_paths = []
+    for img_rel in input_images:
+        img_path = os.path.join(data_root, img_rel)
+        if not os.path.exists(img_path):
+            print(f"    [WARN] image not found, skipping visualization: {img_path}")
+            continue
+        image_paths.append(img_path)
+
+    if not image_paths:
+        raise ValueError(f"No valid images available for visualization: {subject_output}")
+
+    tracker.set_visualize(True)
+    viz_work_dir = tracker.process_image_sequence_visualization(
+        image_paths,
+        subject_output,
+    )
+    viz_src = os.path.join(viz_work_dir, "pose_visualized.mp4")
+    if not os.path.exists(viz_src):
+        raise FileNotFoundError(f"Subject visualization missing: {viz_src}")
+    shutil.move(viz_src, os.path.join(subject_output, "pose_visualized.mp4"))
+    shutil.rmtree(viz_work_dir)
+
+
+# ---------------------------------------------------------------------------
+# batch runner helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ImageRecord:
+    img_path: str
+    img_rel: str
+    tmp_root: str        # parent dir; work_dir = tmp_root/stem(img_path)
+    work_dir: str
+    skip_samurai: bool   # True when a pre-existing mask was pre-populated
+    subj_key: str
+    ds_key: str
+    subject_output: str
+    mask_path: str = None  # original external mask (set when skip_samurai=True)
+
+
+def _prepare_record(img_path, img_rel, img_idx, subject_output, ds_key, subj_key):
+    """Create per-image workspace and return an _ImageRecord, or None on failure."""
+    if not os.path.exists(img_path):
+        print(f"    [WARN] image not found, skipping: {img_path}")
+        return None
+
+    # Resolve mask before workspace creation so we can skip imgs_png when possible.
+    mask_path = img_path.replace("/input_images/", "/input_masks/").replace("/images/", "/masks/")
+    found_mask_path = None
+    if mask_path != img_path and os.path.exists(mask_path):
+        found_mask_path = mask_path
+
+    tmp_root = os.path.join(subject_output, f"_img_{img_idx:04d}")
+    os.makedirs(tmp_root, exist_ok=True)
+
+    try:
+        assert_valid_image_path(img_path)
+        # When a mask exists the pipeline stages receive img_path / mask_path
+        # directly, so there is no need to copy the image into imgs_png/.
+        work_dir = prepare_single_image_workspace(
+            img_path, tmp_root, overwrite=True,
+            skip_imgs_png=(found_mask_path is not None),
+        )
+    except Exception as e:
+        print(f"    [WARN] workspace prep failed for {img_path}: {e}")
+        return None
+
+    return _ImageRecord(
+        img_path=img_path,
+        img_rel=img_rel,
+        tmp_root=tmp_root,
+        work_dir=work_dir,
+        skip_samurai=(found_mask_path is not None),
+        subj_key=subj_key,
+        ds_key=ds_key,
+        subject_output=subject_output,
+        mask_path=found_mask_path,
+    )
+
+
+def _run_stages_bulk(tracker, records, with_flame):
+    """Run all pipeline stages across every record, one stage at a time.
+
+    Stage order: predict_box → samurai → sapiens (single model load) →
+    video2motion → flame.  Running stage-by-stage avoids re-loading model
+    weights for each image.
+    """
+    if not records:
+        return
+
+    print(f"\n  [BULK] predict_box: {len(records)} images")
+    for rec in records:
+        predict_box(tracker.sam2seg, rec.work_dir, img_path=rec.img_path)
+
+    samurai_records = [r for r in records if not r.skip_samurai]
+    n_skip = len(records) - len(samurai_records)
+    print(f"  [BULK] samurai: {len(samurai_records)} images ({n_skip} using pre-existing mask)")
+    for rec in samurai_records:
+        run_samurai(tracker.model_path, rec.work_dir, visualize=False)
+
+    print(f"  [BULK] sapiens: {len(records)} images (single model load)")
+    run_sapiens_batch(
+        tracker.model_path,
+        [rec.work_dir for rec in records],
+        img_paths=[rec.img_path for rec in records],
+        seg_paths=[rec.mask_path for rec in records],
+    )
+
+    print(f"  [BULK] video2motion: {len(records)} images")
+    for rec in records:
+        tracker.video2motion(rec.work_dir, rec.tmp_root, fps=1,
+                             img_path=rec.img_path, seg_path=rec.mask_path)
+
+    if with_flame and tracker.gaga_track is not None:
+        print(f"  [BULK] flame: {len(records)} images")
+        for rec in records:
+            estimate_flame(tracker.gaga_track, rec.work_dir)
+
+
+def _aggregate_subject(subj_records, subject_output, visualize, tracker, use_symlink=False):
+    """Collect per-image results into subject-level files and clean up temp dirs."""
+    smplx_params = {}
+    sapiens_poses = {}
+    flame_params = {}
+    bboxes = {}
+    processed_image_paths = []
+
+    for rec in subj_records:
+        smplx = _load_smplx(rec.work_dir)
+        if smplx is not None:
+            smplx_params[rec.img_rel] = smplx
+
+        sap = _load_sapiens(rec.work_dir)
+        if sap is not None:
+            sapiens_poses[rec.img_rel] = sap
+
+        flame = _load_flame(rec.work_dir)
+        if flame is not None:
+            flame_params[rec.img_rel] = flame
+
+        bbox = _load_bbox(rec.work_dir)
+        if bbox is not None:
+            bboxes[rec.img_rel] = bbox
+
+        seg_dir = os.path.join(subject_output, "samurai_seg")
+        key_name = rec.img_rel.replace("/", "_").replace(os.sep, "_")
+        seg_dest = os.path.join(seg_dir, f"{key_name}.png")
+        if use_symlink:
+            assert rec.skip_samurai and rec.mask_path, (
+                f"use_symlink requires skip_samurai=True and a known mask_path, got: {rec.img_rel}"
+            )
+            os.makedirs(seg_dir, exist_ok=True)
+            os.symlink(rec.mask_path, seg_dest)
         else:
-            concat_list = os.path.join(subject_output, "_viz_concat.txt")
-            with open(concat_list, "w") as f:
-                for clip in viz_clips:
-                    f.write(f"file '{os.path.abspath(clip)}'\n")
-            try:
-                subprocess.run(
-                    [
-                        imageio_ffmpeg.get_ffmpeg_exe(),
-                        "-y", "-f", "concat", "-safe", "0",
-                        "-i", concat_list, "-c", "copy", out_video,
-                    ],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            finally:
-                os.remove(concat_list)
-                for clip in viz_clips:
-                    if os.path.exists(clip):
-                        os.remove(clip)
-        print(f"  Visualization: {out_video}")
+            seg_src = os.path.join(rec.work_dir, "samurai_seg", "00001.png")
+            if os.path.exists(seg_src):
+                os.makedirs(seg_dir, exist_ok=True)
+                shutil.copy2(seg_src, seg_dest)
+
+        processed_image_paths.append(rec.img_path)
+
+    if smplx_params:
+        with open(os.path.join(subject_output, "smplx_params.pkl"), "wb") as f:
+            pickle.dump(smplx_params, f)
+    if sapiens_poses:
+        np.save(os.path.join(subject_output, "sapiens_pose.npy"), sapiens_poses)
+    if flame_params:
+        with open(os.path.join(subject_output, "flame_params.pkl"), "wb") as f:
+            pickle.dump(flame_params, f)
+    if bboxes:
+        with open(os.path.join(subject_output, "bbox.pkl"), "wb") as f:
+            pickle.dump(bboxes, f)
+
+    for rec in subj_records:
+        if os.path.isdir(rec.tmp_root):
+            shutil.rmtree(rec.tmp_root)
+
+    if visualize and processed_image_paths:
+        tracker.set_visualize(True)
+        viz_work_dir = tracker.process_image_sequence_visualization(
+            processed_image_paths, subject_output,
+        )
+        viz_src = os.path.join(viz_work_dir, "pose_visualized.mp4")
+        if os.path.exists(viz_src):
+            shutil.move(viz_src, os.path.join(subject_output, "pose_visualized.mp4"))
+        shutil.rmtree(viz_work_dir)
 
     return len(smplx_params)
 
@@ -236,6 +431,10 @@ def process_subject(tracker, subj_key, input_images, data_root, subject_output, 
 
 def run_batch(tracker, opt):
     """Process all subjects in all datasets from a data_val_list.yaml config.
+
+    All images across all subjects are processed stage-by-stage (predict_box →
+    samurai → sapiens → video2motion → flame) to avoid loading model weights
+    repeatedly.  Per-subject aggregation into pkl/npy files happens afterwards.
 
     Visualisation (smplx render + overlay) is produced for the first
     ``--n_vis_subjects`` subjects (globally across all datasets).
@@ -260,6 +459,12 @@ def run_batch(tracker, opt):
     global_subj_idx = 0
     viz_count = 0
 
+    # -----------------------------------------------------------------------
+    # Phase A: collect records and prepare per-image workspaces
+    # -----------------------------------------------------------------------
+    all_records = []       # flat list of _ImageRecord across all subjects
+    subj_meta_list = []    # per-subject metadata for Phase C aggregation
+
     for ds_key, ds_cfg in zip(ds_keys, ds_list):
         image_list_path = os.path.join(sam3dgs_root, ds_cfg["image_list"])
         if not os.path.exists(image_list_path):
@@ -281,7 +486,6 @@ def run_batch(tracker, opt):
                 continue
 
             visualize = opt.n_vis_subjects < 0 or viz_count < opt.n_vis_subjects
-            tracker.set_visualize(visualize)
             if visualize:
                 viz_count += 1
 
@@ -289,7 +493,6 @@ def run_batch(tracker, opt):
             subject_output = os.path.join(opt.output_path, ds_key, subj_dir)
             os.makedirs(subject_output, exist_ok=True)
 
-            # resume: both aggregated outputs must exist
             done_pkl = os.path.join(subject_output, "smplx_params.pkl")
             done_npy = os.path.join(subject_output, "sapiens_pose.npy")
             if os.path.exists(done_pkl) and os.path.exists(done_npy):
@@ -302,22 +505,56 @@ def run_batch(tracker, opt):
             seen = set(input_images)
             all_images = list(input_images) + [img for img in extra_images if img not in seen]
             n_extra = len(all_images) - len(input_images)
+
             print(
-                f"  Subject [{ds_subj_idx+1}/{len(subjects)}] {subj_key}"
+                f"  Queuing [{ds_subj_idx+1}/{len(subjects)}] {subj_key}"
                 f"  images={len(all_images)} (input={len(input_images)} extra={n_extra})"
                 f"  visualize={visualize}"
                 + (f"  rank={opt.rank}/{opt.n_rank}" if opt.n_rank > 1 else "")
             )
 
-            try:
-                n_done = process_subject(
-                    tracker, subj_key, all_images, data_root,
-                    subject_output, visualize,
+            range_start = len(all_records)
+            for img_idx, img_rel in enumerate(all_images):
+                img_path = os.path.join(data_root, img_rel)
+                rec = _prepare_record(
+                    img_path, img_rel, img_idx, subject_output, ds_key, subj_key,
                 )
-                print(f"  Done: {n_done}/{len(input_images)} images")
-            except Exception:
-                print(f"  [ERROR] subject {subj_key}")
-                traceback.print_exc()
+                if rec is not None:
+                    all_records.append(rec)
+            range_end = len(all_records)
+
+            subj_meta_list.append({
+                "subj_key": subj_key,
+                "ds_key": ds_key,
+                "subject_output": subject_output,
+                "visualize": visualize,
+                "input_count": len(input_images),
+                "range": (range_start, range_end),
+            })
+
+    if not all_records:
+        print("No images to process.")
+        return
+
+    print(f"\n[BULK] {len(all_records)} images across {len(subj_meta_list)} subjects")
+
+    # -----------------------------------------------------------------------
+    # Phase B: run all pipeline stages across all images
+    # -----------------------------------------------------------------------
+    _run_stages_bulk(tracker, all_records, with_flame=opt.with_flame)
+
+    # -----------------------------------------------------------------------
+    # Phase C: aggregate results per subject and clean up temp dirs
+    # -----------------------------------------------------------------------
+    print("\n[AGGREGATE] Collecting per-subject results...")
+    for meta in subj_meta_list:
+        start, end = meta["range"]
+        subj_records = all_records[start:end]
+        n_done = _aggregate_subject(
+            subj_records, meta["subject_output"], meta["visualize"], tracker,
+            use_symlink=opt.use_symlink,
+        )
+        print(f"  {meta['subj_key']}: {n_done}/{meta['input_count']} images")
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +627,8 @@ def get_parse():
                         help="Enable smplx render + overlay visualisation (single-image mode)")
     parser.add_argument("--with_flame", action="store_true",
                         help="Also estimate FLAME face parameters")
+    parser.add_argument("--use_symlink", action="store_true",
+                        help="Symlink masks instead of copying (requires all images to have pre-existing masks)")
 
     # single-image-only options
     parser.add_argument("--compare_json", type=str, default=None,

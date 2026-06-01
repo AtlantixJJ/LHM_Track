@@ -178,6 +178,27 @@ def generate_pseudo_idx(keypoints, patch_size, n_patch, crop_annotation):
     return pseudo_idx, max_dist
 
 
+
+def _run_pose_model(pose_model, image, K, pseudo_idx, max_dist):
+    humans = forward_model(
+        pose_model,
+        image,
+        K,
+        pseudo_idx=pseudo_idx,
+        max_dist=max_dist,
+    )
+    if len(humans) > 0 or pseudo_idx is None:
+        return humans
+
+    return forward_model(
+        pose_model,
+        image,
+        K,
+        pseudo_idx=None,
+        max_dist=None,
+    )
+
+
 def project2origin_img(target_human, crop_annotation):
     if target_human is None:
         return target_human
@@ -242,7 +263,12 @@ def parse_chunks(
             }
             padded_pose_results = empty_frame_pad(pose_results[start:bk])
 
-            for pose_result in padded_pose_results:
+            for chunk_offset, pose_result in enumerate(padded_pose_results):
+                if pose_result is None:
+                    frame_id = int(f_chunk[chunk_offset])
+                    raise ValueError(
+                        f"Missing pose model result after padding for frame_id={frame_id}"
+                    )
                 data_chunk["rotvec"].append(pose_result["rotvec"])
                 data_chunk["beta"].append(pose_result["shape"])
                 data_chunk["loc"].append(pose_result["loc"])
@@ -266,7 +292,12 @@ def parse_chunks(
             "dist": [],
         }
         padded_pose_results = empty_frame_pad(pose_results[start:bk])
-        for pose_result in padded_pose_results:
+        for chunk_offset, pose_result in enumerate(padded_pose_results):
+            if pose_result is None:
+                frame_id = int(f_chunk[chunk_offset])
+                raise ValueError(
+                    f"Missing pose model result after padding for frame_id={frame_id}"
+                )
             data_chunk["rotvec"].append(pose_result["rotvec"])
             data_chunk["beta"].append(pose_result["shape"])
             data_chunk["loc"].append(pose_result["loc"])
@@ -278,10 +309,7 @@ def parse_chunks(
 
     for data_chunk in data_chunks:
         for key in ["rotvec", "beta", "loc", "dist"]:
-            try:
-                data_chunk[key] = torch.stack(data_chunk[key])
-            except:
-                print(key)
+            data_chunk[key] = torch.stack(data_chunk[key])
 
     return data_chunks
 
@@ -352,7 +380,22 @@ class Video2MotionPipeline:
             is_smooth_fitting=is_smooth_fitting,
         )
 
-    def track_from_mask(self, output_path, offset_w, offset_h):
+    def track_from_mask(self, output_path, offset_w, offset_h, seg_file=None):
+        if seg_file is not None:
+            img = cv2.imread(seg_file)
+            pha = img[..., -1:]
+            masks = copy.deepcopy(pha)
+            masks[masks < 1.0] = 0.0
+            masks[masks >= 1.0] = 1.0
+            _h, _w, _ = np.where(masks == 1)
+            xyxy = [
+                _w.min().item() + offset_w,
+                _h.min().item() + offset_h,
+                _w.max().item() + offset_w,
+                _h.max().item() + offset_h,
+            ]
+            return [np.array(xyxy)], [0]
+
         mask_path = os.path.join(output_path, "samurai_seg")
         l_img_path = [
             file
@@ -418,7 +461,15 @@ class Video2MotionPipeline:
             raise NotImplementedError
         return bboxes, keypoints
 
-    def estimate_pose(self, frame_ids, frames, keypoints, bboxes, raw_K, video_length):
+    def estimate_pose(
+        self,
+        frame_ids,
+        frames,
+        keypoints,
+        bboxes,
+        raw_K,
+        video_length,
+    ):
         target_img_size = self.pose_model.img_size
         patch_size = self.pose_model.patch_size
 
@@ -451,14 +502,12 @@ class Video2MotionPipeline:
                 int(target_img_size / patch_size),
                 crop_annotations[i],
             )
-            humans = forward_model(
-                self.pose_model,
-                image,
-                K,
-                pseudo_idx=pseudo_idx,
-                max_dist=max_dist,
-            )
+            humans = _run_pose_model(self.pose_model, image, K, pseudo_idx, max_dist)
             target_human = track_by_area(humans, target_img_size)
+            if target_human is None:
+                raise ValueError(
+                    f"Pose model did not return a target human for frame_id={int(frame_ids[i])}"
+                )
             target_human = project2origin_img(target_human, crop_annotations[i])
 
             all_frame_results.append(target_human)
@@ -513,7 +562,9 @@ class Video2MotionPipeline:
                 or torch.isinf(betas).any()
                 or torch.isinf(transl).any()
             ):
-                continue
+                raise ValueError(
+                    f"Non-finite SMPLify output for frame_ids={data_chunk['frame_id']}"
+                )
 
             # gaussian filter
             with torch.no_grad():
@@ -541,12 +592,9 @@ class Video2MotionPipeline:
                 trans_cam_fill[data_chunk["frame_id"]] = transl.cpu().numpy()
 
             for i, frame_id in enumerate(data_chunk["frame_id"]):
-                try:
-                    if all_verts[frame_id] is None:
-                        all_verts[frame_id] = []
-                    all_verts[frame_id].append(out["v3d"][i])
-                except:
-                    break
+                if all_verts[frame_id] is None:
+                    all_verts[frame_id] = []
+                all_verts[frame_id].append(out["v3d"][i])
 
         return (
             smpl_poses_cam_fill,
@@ -590,16 +638,19 @@ class Video2MotionPipeline:
 
     def save_results(self, out_path, frame_ids, poses, betas, transl, K, img_wh):
         K_np = K[0].cpu().numpy()
-        ids = np.array(frame_ids, dtype=np.int64)
-        poses_sel = poses[ids]  # [N, 55, 3]
+        # Save ALL video frames (0-indexed), not just SAMURAI-tracked ones.
+        # poses/betas/transl are video_length-long arrays; untracked frames stay zero.
+        video_length = poses.shape[0]
+        ids = np.arange(video_length, dtype=np.int64)
+        poses_sel = poses[ids]  # [video_length, 55, 3]
         data = {
             "frame_ids": (ids + 1).astype(np.int32),  # 1-indexed
             "betas": betas[ids].astype(np.float32),                     # [N, 10]
             "root_pose": poses_sel[:, 0].astype(np.float32),            # [N, 3]
             "body_pose": poses_sel[:, 1:22].astype(np.float32),         # [N, 21, 3]
             "jaw_pose": poses_sel[:, 22].astype(np.float32),            # [N, 3]
-            "leye_pose": np.zeros((len(ids), 3), dtype=np.float32),
-            "reye_pose": np.zeros((len(ids), 3), dtype=np.float32),
+            "leye_pose": np.zeros((video_length, 3), dtype=np.float32),
+            "reye_pose": np.zeros((video_length, 3), dtype=np.float32),
             "lhand_pose": poses_sel[:, 25:40].astype(np.float32),       # [N, 15, 3]
             "rhand_pose": poses_sel[:, 40:55].astype(np.float32),       # [N, 15, 3]
             "trans": transl[ids].astype(np.float32),                    # [N, 3]
@@ -610,14 +661,24 @@ class Video2MotionPipeline:
         }
         np.save(os.path.join(out_path, "smplx_params.npy"), data)
 
-    def __call__(self, video_path, output_path, fps):
+    def __call__(self, video_path, output_path, fps, img_path=None, seg_path=None):
         start = time.time()
         output_folder = os.path.join(
             output_path, video_path.split("/")[-1].split(".")[0]
         )
         os.makedirs(output_folder, exist_ok=True)
 
-        if os.path.isdir(video_path):
+        if img_path is not None:
+            image = cv2.imread(img_path)
+            if image is None:
+                raise ValueError(f"Failed to read image: {img_path}")
+            if self.pad_ratio > 0:
+                image, offset_w, offset_h = img_center_padding(image, self.pad_ratio)
+            else:
+                offset_w, offset_h = 0, 0
+            raw_H, raw_W = image.shape[:2]
+            all_frames = [image]
+        elif os.path.isdir(video_path):
             all_frames, raw_H, raw_W, _, offset_w, offset_h = load_frames(
                 os.path.join(video_path, "imgs_png"),
                 pad_ratio=self.pad_ratio,
@@ -644,7 +705,7 @@ class Video2MotionPipeline:
         if self.track_mode == "yolo":
             bboxes, frame_ids, frames = self.track(all_frames)
         elif self.track_mode == "samurai":
-            bboxes, frame_ids = self.track_from_mask(output_folder, offset_w, offset_h)
+            bboxes, frame_ids = self.track_from_mask(output_folder, offset_w, offset_h, seg_file=seg_path)
             frames = [all_frames[i] for i in frame_ids]
         else:
             raise NotImplementedError
@@ -656,7 +717,12 @@ class Video2MotionPipeline:
         torch.cuda.empty_cache()
 
         poses, betas, transl, verts = self.estimate_pose(
-            frame_ids, frames, keypoints, bboxes, raw_K, video_length
+            frame_ids,
+            frames,
+            keypoints,
+            bboxes,
+            raw_K,
+            video_length,
         )
 
         if self.visualize:
