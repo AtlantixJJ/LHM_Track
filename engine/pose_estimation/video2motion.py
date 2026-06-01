@@ -323,6 +323,7 @@ class Video2MotionPipeline:
         track_mode="yolo",
         visualize=False,
         is_smooth=True,
+        is_smooth_fitting=True,
         pad_ratio=0.2,
         fov=60,
         min_track_len=None,
@@ -348,6 +349,7 @@ class Video2MotionPipeline:
             device=self.device,
             num_steps=50,
             is_smooth=is_smooth,
+            is_smooth_fitting=is_smooth_fitting,
         )
 
     def track_from_mask(self, output_path, offset_w, offset_h):
