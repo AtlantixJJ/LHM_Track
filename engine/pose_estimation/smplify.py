@@ -207,6 +207,7 @@ class TemporalSMPLify:
         num_steps=100,
         device=None,
         is_smooth=True,
+        is_smooth_fitting=True,
     ):
 
         self.smpl = smpl
@@ -215,6 +216,7 @@ class TemporalSMPLify:
         self.num_steps = num_steps
         self.device = device
         self.is_smooth = is_smooth
+        self.is_smooth_fitting = is_smooth_fitting
 
         resutls = get_mapping("smplx", "coco_wholebody")
         full_mapping_list = resutls[-1]
@@ -325,7 +327,7 @@ class TemporalSMPLify:
             cam_intrinsics=cam_intrinsic,
             device=self.device,
             j3d_idx=self.first_fitting_src_idx,
-            is_smooth=self.is_smooth,
+            is_smooth=self.is_smooth_fitting,
         )
 
         for j in (j_bar := tqdm(range(30))):
@@ -351,7 +353,7 @@ class TemporalSMPLify:
             init_pose=init_poses_,
             device=self.device,
             j3d_idx=self.src_idx,
-            is_smooth=self.is_smooth,
+            is_smooth=self.is_smooth_fitting,
         )
 
         optimizer = torch.optim.Adam(params, lr=lr)
