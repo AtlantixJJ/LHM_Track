@@ -1,5 +1,9 @@
 # Copyright 2024-2025 The Alibaba 3DAIGC Team Authors. All rights reserved.
-
+"""
+python track_video.py --video_path
+ /home/jianjin/SAM3DGS/data/AnimatableHuman/NeuMan/videos --output_path
+ /home/jianjin/SAM3DGS/data/AnimatableHuman/NeuMan/lhm_track_npy --model_path ./pretrained_models
+"""
 import argparse
 import os
 import traceback
@@ -44,6 +48,7 @@ class BaseTracker:
             kp_mode="sapiens",
             track_mode="samurai",
             is_smooth=False,
+            is_smooth_fitting=True,
             pad_ratio=self.opt.pad_ratio,
             visualize=self.opt.save_visualization,
         )
