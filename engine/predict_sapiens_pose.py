@@ -98,24 +98,8 @@ def cleanup_sapiens_json(output_dir):
             os.remove(os.path.join(sapiens_dir, fname))
 
 
-def run_sapiens_batch(model_path, work_dirs, img_paths=None, seg_paths=None, visualize=False):
-    """Run sapiens pose estimation on all work_dirs in a single subprocess.
-
-    Images and masks are collected into a temporary flat directory.
-    When img_paths / seg_paths are provided they are used directly (no workspace
-    copy needed); otherwise falls back to work_dir/imgs_png/ and samurai_seg/.
-    Outputs are redistributed to each work_dir's ``sapiens_pose/`` folder.
-    """
-    model_full = os.path.join(
-        model_path,
-        "sapiens/poses/sapiens_1b_coco_wholebody_best_coco_wholebody_AP_727_torchscript.pt2",
-    )
-    if not os.path.exists(model_full):
-        raise FileNotFoundError(
-            f"Sapiens pose model not found: {model_full}\n"
-            "Download LHM_track_model.tar and extract into pretrained_models/."
-        )
-
+def _run_sapiens_chunk(model_full, chunk, img_paths, seg_paths, visualize):
+    """Run sapiens on one chunk of (global_idx, work_dir) pairs."""
     with tempfile.TemporaryDirectory() as tmp:
         imgs_dir = os.path.join(tmp, "imgs_png")
         segs_dir = os.path.join(tmp, "samurai_seg")
@@ -125,25 +109,25 @@ def run_sapiens_batch(model_path, work_dirs, img_paths=None, seg_paths=None, vis
         os.makedirs(out_dir)
 
         valid = []
-        for idx, work_dir in enumerate(work_dirs):
+        for local_idx, (global_idx, work_dir) in enumerate(chunk):
             src_img = (
-                img_paths[idx] if img_paths is not None
+                img_paths[global_idx] if img_paths is not None
                 else os.path.join(work_dir, "imgs_png", "00001.png")
             )
             if not os.path.exists(src_img):
                 print(f"[WARN] sapiens_batch: image not found, skipping: {src_img}")
                 continue
-            name = f"{idx:04d}_00001.png"
+            name = f"{local_idx:04d}_00001.png"
             os.symlink(os.path.abspath(src_img), os.path.join(imgs_dir, name))
 
             src_seg = (
-                seg_paths[idx] if seg_paths is not None
+                seg_paths[global_idx] if seg_paths is not None
                 else os.path.join(work_dir, "samurai_seg", "00001.png")
             )
             if src_seg and os.path.exists(src_seg):
                 os.symlink(os.path.abspath(src_seg), os.path.join(segs_dir, name))
 
-            valid.append((idx, work_dir))
+            valid.append((local_idx, work_dir))
 
         if not valid:
             return
@@ -162,8 +146,8 @@ def run_sapiens_batch(model_path, work_dirs, img_paths=None, seg_paths=None, vis
         if ret != 0:
             raise RuntimeError(f"run_sapiens_batch failed with exit code {ret}: {cmd}")
 
-        for idx, work_dir in valid:
-            src_json = os.path.join(out_dir, f"{idx:04d}_00001.json")
+        for local_idx, work_dir in valid:
+            src_json = os.path.join(out_dir, f"{local_idx:04d}_00001.json")
             if not os.path.exists(src_json):
                 print(f"[WARN] sapiens_batch: no output json for {work_dir}")
                 continue
@@ -171,3 +155,29 @@ def run_sapiens_batch(model_path, work_dirs, img_paths=None, seg_paths=None, vis
             os.makedirs(sap_dir, exist_ok=True)
             shutil.copy2(src_json, os.path.join(sap_dir, "00001.json"))
             consolidate_sapiens_pose(sap_dir, delete_json=False, delete_png=not visualize)
+
+
+def run_sapiens_batch(model_path, work_dirs, img_paths=None, seg_paths=None,
+                      visualize=False, chunk_size=500):
+    """Run sapiens pose estimation on all work_dirs, split into chunks to avoid OOM.
+
+    Images and masks are collected into a temporary flat directory per chunk.
+    When img_paths / seg_paths are provided they are used directly (no workspace
+    copy needed); otherwise falls back to work_dir/imgs_png/ and samurai_seg/.
+    Outputs are redistributed to each work_dir's ``sapiens_pose/`` folder.
+    """
+    model_full = os.path.join(
+        model_path,
+        "sapiens/poses/sapiens_1b_coco_wholebody_best_coco_wholebody_AP_727_torchscript.pt2",
+    )
+    if not os.path.exists(model_full):
+        raise FileNotFoundError(
+            f"Sapiens pose model not found: {model_full}\n"
+            "Download LHM_track_model.tar and extract into pretrained_models/."
+        )
+
+    indexed = list(enumerate(work_dirs))
+    chunks = [indexed[i:i + chunk_size] for i in range(0, len(indexed), chunk_size)]
+    for chunk in chunks:
+        _run_sapiens_chunk(model_full, chunk, img_paths, seg_paths, visualize)
+

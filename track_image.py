@@ -8,6 +8,7 @@ import shutil
 import numpy as np
 import torch
 import yaml
+from tqdm import tqdm
 
 from dataclasses import dataclass
 
@@ -271,25 +272,35 @@ class _ImageRecord:
     subj_key: str
     ds_key: str
     subject_output: str
-    mask_path: str = None  # original external mask (set when skip_samurai=True)
+    mask_path: str = None   # original external mask (set when skip_samurai=True)
+    sapiens_done: bool = False  # True when sapiens_pose.npy already exists (resume)
 
 
-def _prepare_record(img_path, img_rel, img_idx, subject_output, ds_key, subj_key):
+def _prepare_record(img_path, img_rel, img_idx, subject_output, ds_key, subj_key,
+                    skip_folder_check=False):
     """Create per-image workspace and return an _ImageRecord, or None on failure."""
-    if not os.path.exists(img_path):
-        print(f"    [WARN] image not found, skipping: {img_path}")
-        return None
-
-    # Resolve mask before workspace creation so we can skip imgs_png when possible.
     mask_path = img_path.replace("/input_images/", "/input_masks/").replace("/images/", "/masks/")
-    found_mask_path = None
-    if mask_path != img_path and os.path.exists(mask_path):
-        found_mask_path = mask_path
-
     tmp_root = os.path.join(subject_output, f"_img_{img_idx:04d}")
-    os.makedirs(tmp_root, exist_ok=True)
+    # Derive work_dir unconditionally so resume detection works in both modes.
+    work_dir = os.path.join(tmp_root, image_stem(img_path))
 
-    try:
+    if skip_folder_check:
+        found_mask_path = mask_path if mask_path != img_path else None
+    else:
+        if not os.path.exists(img_path):
+            print(f"    [WARN] image not found, skipping: {img_path}")
+            return None
+
+        found_mask_path = None
+        if mask_path != img_path and os.path.exists(mask_path):
+            found_mask_path = mask_path
+
+    # Check for a resumable previous run regardless of skip_folder_check.
+    sapiens_done = os.path.exists(
+        os.path.join(work_dir, "sapiens_pose", "sapiens_pose.npy")
+    )
+
+    if not skip_folder_check and not sapiens_done:
         assert_valid_image_path(img_path)
         # When a mask exists the pipeline stages receive img_path / mask_path
         # directly, so there is no need to copy the image into imgs_png/.
@@ -297,60 +308,51 @@ def _prepare_record(img_path, img_rel, img_idx, subject_output, ds_key, subj_key
             img_path, tmp_root, overwrite=True,
             skip_imgs_png=(found_mask_path is not None),
         )
-    except Exception as e:
-        print(f"    [WARN] workspace prep failed for {img_path}: {e}")
-        return None
 
     return _ImageRecord(
         img_path=img_path,
         img_rel=img_rel,
         tmp_root=tmp_root,
         work_dir=work_dir,
-        skip_samurai=(found_mask_path is not None),
+        skip_samurai=(found_mask_path is not None) or sapiens_done,
         subj_key=subj_key,
         ds_key=ds_key,
         subject_output=subject_output,
         mask_path=found_mask_path,
+        sapiens_done=sapiens_done,
     )
 
 
-def _run_stages_bulk(tracker, records, with_flame):
-    """Run all pipeline stages across every record, one stage at a time.
+def _run_stages_bulk(tracker, records):
+    """Run predict_box, samurai, and sapiens stages across all records in bulk.
 
-    Stage order: predict_box → samurai → sapiens (single model load) →
-    video2motion → flame.  Running stage-by-stage avoids re-loading model
-    weights for each image.
+    Stage order: predict_box → samurai → sapiens.  video2motion and flame are
+    intentionally omitted here; they are run per-subject in Phase C so each
+    subject can be visualised as soon as it finishes.
     """
     if not records:
         return
 
-    print(f"\n  [BULK] predict_box: {len(records)} images")
-    for rec in records:
-        predict_box(tracker.sam2seg, rec.work_dir, img_path=rec.img_path)
-
     samurai_records = [r for r in records if not r.skip_samurai]
-    n_skip = len(records) - len(samurai_records)
-    print(f"  [BULK] samurai: {len(samurai_records)} images ({n_skip} using pre-existing mask)")
-    for rec in samurai_records:
+    sapiens_records = [r for r in records if not r.sapiens_done]
+    n_skip_samurai = len(records) - len(samurai_records)
+    n_skip_sapiens = len(records) - len(sapiens_records)
+    print(f"  [BULK] samurai: {len(samurai_records)} images ({n_skip_samurai} skipped)")
+    print(f"  [BULK] sapiens: {len(sapiens_records)} images ({n_skip_sapiens} already done)")
+
+    for rec in tqdm(samurai_records, desc="predict_box"):
+        predict_box(tracker.sam2seg, rec.work_dir, img_path=rec.img_path)
+    for rec in tqdm(samurai_records, desc="samurai"):
         run_samurai(tracker.model_path, rec.work_dir, visualize=False)
 
-    print(f"  [BULK] sapiens: {len(records)} images (single model load)")
-    run_sapiens_batch(
-        tracker.model_path,
-        [rec.work_dir for rec in records],
-        img_paths=[rec.img_path for rec in records],
-        seg_paths=[rec.mask_path for rec in records],
-    )
-
-    print(f"  [BULK] video2motion: {len(records)} images")
-    for rec in records:
-        tracker.video2motion(rec.work_dir, rec.tmp_root, fps=1,
-                             img_path=rec.img_path, seg_path=rec.mask_path)
-
-    if with_flame and tracker.gaga_track is not None:
-        print(f"  [BULK] flame: {len(records)} images")
-        for rec in records:
-            estimate_flame(tracker.gaga_track, rec.work_dir)
+    if sapiens_records:
+        run_sapiens_batch(
+            tracker.model_path,
+            [rec.work_dir for rec in sapiens_records],
+            img_paths=[rec.img_path for rec in sapiens_records],
+            seg_paths=[rec.mask_path for rec in sapiens_records],
+            chunk_size=tracker.opt.sapiens_chunk_size,
+        )
 
 
 def _aggregate_subject(subj_records, subject_output, visualize, tracker, use_symlink=False):
@@ -386,7 +388,8 @@ def _aggregate_subject(subj_records, subject_output, visualize, tracker, use_sym
                 f"use_symlink requires skip_samurai=True and a known mask_path, got: {rec.img_rel}"
             )
             os.makedirs(seg_dir, exist_ok=True)
-            os.symlink(rec.mask_path, seg_dest)
+            if not os.path.exists(seg_dest):
+                os.symlink(rec.mask_path, seg_dest)
         else:
             seg_src = os.path.join(rec.work_dir, "samurai_seg", "00001.png")
             if os.path.exists(seg_src):
@@ -395,6 +398,8 @@ def _aggregate_subject(subj_records, subject_output, visualize, tracker, use_sym
 
         processed_image_paths.append(rec.img_path)
 
+    if smplx_params or sapiens_poses or flame_params or bboxes:
+        os.makedirs(subject_output, exist_ok=True)
     if smplx_params:
         with open(os.path.join(subject_output, "smplx_params.pkl"), "wb") as f:
             pickle.dump(smplx_params, f)
@@ -431,16 +436,21 @@ def _aggregate_subject(subj_records, subject_output, visualize, tracker, use_sym
 def run_batch(tracker, opt):
     """Process all subjects in all datasets from a data_val_list.yaml config.
 
-    All images across all subjects are processed stage-by-stage (predict_box →
-    samurai → sapiens → video2motion → flame) to avoid loading model weights
-    repeatedly.  Per-subject aggregation into pkl/npy files happens afterwards.
+    Phase A: collect all per-image records and prepare workspaces.
+    Phase B: predict_box → samurai → sapiens in bulk across all images.
+    Phase C: for each subject: video2motion → flame → aggregate → visualize.
+    Running Phase B in bulk avoids reloading model weights for each image.
+    Running Phase C per-subject allows visualisation immediately after each
+    subject finishes rather than waiting for the entire dataset.
+
+    Resume: subjects where both ``smplx_params.pkl`` and ``sapiens_pose.npy``
+    already exist are skipped.  Images where ``sapiens_pose/sapiens_pose.npy``
+    exists in the temp workspace skip predict_box/samurai/sapiens.  Images
+    where ``smplx_params.npy`` exists skip video2motion.
 
     Visualisation (smplx render + overlay) is produced for the first
     ``--n_vis_subjects`` subjects (globally across all datasets).
     Pass ``-1`` to visualise every subject.
-
-    Subjects where both ``smplx_params.pkl`` and ``sapiens_pose.npy`` already
-    exist are skipped (resume).
 
     With ``--rank R --n_rank N`` only subjects whose global index satisfies
     ``index % N == R`` are processed, enabling multi-process parallelism.
@@ -490,7 +500,6 @@ def run_batch(tracker, opt):
 
             subj_dir = subj_key.replace("/", "_").replace(os.sep, "_")
             subject_output = os.path.join(opt.output_path, ds_key, subj_dir)
-            os.makedirs(subject_output, exist_ok=True)
 
             done_pkl = os.path.join(subject_output, "smplx_params.pkl")
             done_npy = os.path.join(subject_output, "sapiens_pose.npy")
@@ -513,10 +522,11 @@ def run_batch(tracker, opt):
             )
 
             range_start = len(all_records)
-            for img_idx, img_rel in enumerate(all_images):
+            for img_idx, img_rel in enumerate(tqdm(all_images, desc=f"prepare {subj_key}", leave=False)):
                 img_path = os.path.join(data_root, img_rel)
                 rec = _prepare_record(
                     img_path, img_rel, img_idx, subject_output, ds_key, subj_key,
+                    skip_folder_check=opt.skip_folder_check,
                 )
                 if rec is not None:
                     all_records.append(rec)
@@ -538,22 +548,33 @@ def run_batch(tracker, opt):
     print(f"\n[BULK] {len(all_records)} images across {len(subj_meta_list)} subjects")
 
     # -----------------------------------------------------------------------
-    # Phase B: run all pipeline stages across all images
+    # Phase B: run predict_box, samurai, sapiens across all images in bulk
     # -----------------------------------------------------------------------
-    _run_stages_bulk(tracker, all_records, with_flame=opt.with_flame)
+    _run_stages_bulk(tracker, all_records)
 
     # -----------------------------------------------------------------------
-    # Phase C: aggregate results per subject and clean up temp dirs
+    # Phase C: per-subject video2motion → flame → aggregate → visualize
     # -----------------------------------------------------------------------
-    print("\n[AGGREGATE] Collecting per-subject results...")
-    for meta in subj_meta_list:
+    print("\n[SUBJECTS] Running video2motion + flame per subject...")
+    for meta in tqdm(subj_meta_list, desc="subjects"):
         start, end = meta["range"]
         subj_records = all_records[start:end]
+
+        for rec in subj_records:
+            if not os.path.exists(os.path.join(rec.work_dir, "smplx_params.npy")):
+                tracker.video2motion(rec.work_dir, rec.tmp_root, fps=1,
+                                     img_path=rec.img_path, seg_path=rec.mask_path)
+
+        if opt.with_flame and tracker.gaga_track is not None:
+            for rec in subj_records:
+                if not os.path.exists(os.path.join(rec.work_dir, "flame_params.npy")):
+                    estimate_flame(tracker.gaga_track, rec.work_dir)
+
         n_done = _aggregate_subject(
             subj_records, meta["subject_output"], meta["visualize"], tracker,
             use_symlink=opt.use_symlink,
         )
-        print(f"  {meta['subj_key']}: {n_done}/{meta['input_count']} images")
+        tqdm.write(f"  {meta['subj_key']}: {n_done}/{meta['input_count']} images")
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +649,10 @@ def get_parse():
                         help="Also estimate FLAME face parameters")
     parser.add_argument("--use_symlink", action="store_true",
                         help="Symlink masks instead of copying (requires all images to have pre-existing masks)")
+    parser.add_argument("--skip_folder_check", action="store_true",
+                        help="Skip os.path.exists checks during record preparation (assumes images and masks exist)")
+    parser.add_argument("--sapiens_chunk_size", type=int, default=500,
+                        help="Max images per sapiens subprocess call to avoid OOM (default: 500)")
 
     # single-image-only options
     parser.add_argument("--compare_json", type=str, default=None,

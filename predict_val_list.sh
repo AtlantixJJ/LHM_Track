@@ -32,7 +32,8 @@ for rank in 0 1; do
             --device cuda:0 \
             --rank $rank \
             --n_rank 2 \
-            --use_symlink
+            --use_symlink \
+            --skip_folder_check
     ) > rank${rank}.log 2>&1 &
     PIDS+=( $! )
 done

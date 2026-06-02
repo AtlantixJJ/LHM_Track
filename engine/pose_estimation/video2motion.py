@@ -380,7 +380,9 @@ class Video2MotionPipeline:
 
     def track_from_mask(self, output_path, offset_w, offset_h, seg_file=None):
         if seg_file is not None:
-            img = cv2.imread(seg_file)
+            img = cv2.imread(seg_file, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise ValueError(f"Cannot read seg_file: {seg_file}")
             pha = img[..., -1:]
             masks = copy.deepcopy(pha)
             masks[masks < 1.0] = 0.0
@@ -700,28 +702,32 @@ class Video2MotionPipeline:
         raw_K[..., 1, -1] = raw_H / 2
 
         # human tracking
-        if self.track_mode == "yolo":
-            bboxes, frame_ids, frames = self.track(all_frames)
-        elif self.track_mode == "samurai":
-            bboxes, frame_ids = self.track_from_mask(output_folder, offset_w, offset_h, seg_file=seg_path)
-            frames = [all_frames[i] for i in frame_ids]
-        else:
-            raise NotImplementedError
+        try:
+            if self.track_mode == "yolo":
+                bboxes, frame_ids, frames = self.track(all_frames)
+            elif self.track_mode == "samurai":
+                bboxes, frame_ids = self.track_from_mask(output_folder, offset_w, offset_h, seg_file=seg_path)
+                frames = [all_frames[i] for i in frame_ids]
+            else:
+                raise NotImplementedError
 
-        bboxes, keypoints = self.detect_keypoint2d(
-            bboxes, frames, offset_w, offset_h, frame_ids, output_folder
-        )
-        gc.collect()
-        torch.cuda.empty_cache()
+            bboxes, keypoints = self.detect_keypoint2d(
+                bboxes, frames, offset_w, offset_h, frame_ids, output_folder
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        poses, betas, transl, verts = self.estimate_pose(
-            frame_ids,
-            frames,
-            keypoints,
-            bboxes,
-            raw_K,
-            video_length,
-        )
+            poses, betas, transl, verts = self.estimate_pose(
+                frame_ids,
+                frames,
+                keypoints,
+                bboxes,
+                raw_K,
+                video_length,
+            )
+        except ValueError as e:
+            print(f"[WARN] video2motion: skipping {output_folder}: {e}")
+            return
 
         if self.visualize:
             self.save_video(
