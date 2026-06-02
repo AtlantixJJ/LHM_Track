@@ -1,10 +1,10 @@
 # Copyright 2024-2025 The Alibaba 3DAIGC Team Authors. All rights reserved.
 
 import argparse
-import json
 import os
 import pickle
 import shutil
+import cv2
 import numpy as np
 import torch
 import yaml
@@ -20,10 +20,23 @@ from engine.predict_sapiens_pose import run_sapiens_batch
 from track_image_utils import (
     assert_valid_image_path,
     image_stem,
-    prepare_image_sequence_workspace,
+    letterbox_image,
     prepare_single_image_workspace,
 )
 from track_video import BaseTracker
+
+
+def _resolve_mask_path(mask_path, img_path):
+    """Return the existing mask path, trying .png extension when the original doesn't exist."""
+    if mask_path == img_path:
+        return None
+    if os.path.exists(mask_path):
+        return mask_path
+    base = os.path.splitext(mask_path)[0]
+    png_path = base + ".png"
+    if png_path != mask_path and os.path.exists(png_path):
+        return png_path
+    return None
 
 
 class ImageTracker(BaseTracker):
@@ -74,25 +87,83 @@ class ImageTracker(BaseTracker):
         )
         return work_dir
 
-    def process_image_sequence_visualization(self, image_paths, output_root):
-        work_dir = prepare_image_sequence_workspace(
-            image_paths,
-            output_root,
-            overwrite=True,
-        )
-        self.run_common_stages(
-            work_dir,
-            output_root,
-            fps=1,
-            with_flame=False,
-            visualize=True,
-        )
+    def visualize_from_records(self, subj_records, subject_output):
+        """Generate pose visualization reusing already-computed stage results.
+
+        Combines per-image sapiens keypoints and segmentation masks into a
+        sequence workspace, then calls video2motion with visualize=True,
+        skipping predict_box and sapiens which were already run per-image.
+        Returns the work_dir path, or None if no valid frames were found.
+        """
+        work_dir = os.path.join(subject_output, "_subject_visualization")
+        if os.path.exists(work_dir):
+            shutil.rmtree(work_dir)
+
+        imgs_png_dir = os.path.join(work_dir, "imgs_png")
+        seg_dir = os.path.join(work_dir, "samurai_seg")
+        sap_dir = os.path.join(work_dir, "sapiens_pose")
+        os.makedirs(imgs_png_dir, exist_ok=True)
+        os.makedirs(seg_dir, exist_ok=True)
+        os.makedirs(sap_dir, exist_ok=True)
+
+        sap_frame_ids = []
+        sap_keypoints = []
+        sap_scores = []
+        valid_idx = 0
+        target_h, target_w = None, None
+
+        for rec in subj_records:
+            img_src = os.path.join(rec.work_dir, "imgs_png", "00001.png")
+            if not os.path.exists(img_src):
+                img_src = rec.img_path
+
+            seg_src = os.path.join(rec.work_dir, "samurai_seg", "00001.png")
+            if not os.path.exists(seg_src):
+                if rec.mask_path and os.path.exists(rec.mask_path):
+                    seg_src = rec.mask_path
+                else:
+                    continue
+
+            sap_src = os.path.join(rec.work_dir, "sapiens_pose", "sapiens_pose.npy")
+            if not os.path.exists(sap_src):
+                continue
+
+            img = cv2.imread(img_src)
+            if img is None:
+                continue
+
+            valid_idx += 1
+            frame_name = f"{valid_idx:05d}.png"
+
+            orig_h, orig_w = img.shape[:2]
+            if target_h is None:
+                target_h, target_w = orig_h, orig_w
+
+            normalized, _ = letterbox_image(img, target_h, target_w)
+            cv2.imwrite(os.path.join(imgs_png_dir, frame_name), normalized)
+            shutil.copy2(seg_src, os.path.join(seg_dir, frame_name))
+
+            sap_data = np.load(sap_src, allow_pickle=True).item()
+            sap_frame_ids.append(valid_idx)
+            sap_keypoints.append(sap_data["keypoints"][0])
+            sap_scores.append(sap_data["keypoint_scores"][0])
+
+        if valid_idx == 0:
+            return None
+
+        np.save(os.path.join(sap_dir, "sapiens_pose.npy"), {
+            "frame_ids": np.array(sap_frame_ids, dtype=np.int32),
+            "keypoints": np.stack(sap_keypoints),
+            "keypoint_scores": np.stack(sap_scores),
+        })
+
+        self.video2motion.visualize = True
+        try:
+            self.video2motion(work_dir, subject_output, fps=1)
+        finally:
+            self.video2motion.visualize = False
+
         return work_dir
-
-    def set_visualize(self, visualize: bool):
-        self.opt.visualize = visualize
-        self.video2motion.visualize = visualize
-
 
 # ---------------------------------------------------------------------------
 # per-image result loaders
@@ -128,138 +199,6 @@ def _load_bbox(work_dir):
 
 
 # ---------------------------------------------------------------------------
-# subject-level processing
-# ---------------------------------------------------------------------------
-
-def process_subject(tracker, subj_key, input_images, data_root, subject_output, visualize):
-    """Process all input images for one subject and aggregate into per-subject files.
-
-    Output layout::
-
-        subject_output/
-          smplx_params.pkl      {img_rel -> smplx_dict}
-          sapiens_pose.npy      {img_rel -> {frame_ids, keypoints, keypoint_scores}}
-          flame_params.pkl      {img_rel -> flame_dict}  (only when --with_flame)
-          bbox.pkl              {img_rel -> bbox_str}
-          samurai_seg/          <img_rel sanitized>.png
-          pose_visualized.mp4   subject-level visualization (when visualize=True)
-
-    Each image is processed in an isolated temp dir ``_img_{idx:04d}/`` under
-    ``subject_output`` so that stem collisions across views cannot occur.
-    Temp dirs are deleted after results are extracted.
-    """
-    smplx_params = {}
-    sapiens_poses = {}
-    flame_params = {}
-    bboxes = {}
-    tmp_roots = []
-    processed_image_paths = []
-
-    for img_idx, img_rel in enumerate(input_images):
-        img_path = os.path.join(data_root, img_rel)
-        if not os.path.exists(img_path):
-            print(f"    [WARN] image not found, skipping: {img_path}")
-            continue
-
-        # Isolate each image in its own temp root to avoid stem-name collisions.
-        tmp_root = os.path.join(subject_output, f"_img_{img_idx:04d}")
-        os.makedirs(tmp_root, exist_ok=True)
-        tmp_roots.append(tmp_root)
-
-        mask_path = img_path.replace("/input_images/", "/input_masks/").replace("/images/", "/masks/")
-        if mask_path == img_path:
-            mask_path = None
-
-        print(f"    [{img_idx+1}/{len(input_images)}] {img_rel}" + (" [mask]" if mask_path and os.path.exists(mask_path) else ""))
-        tracker.set_visualize(False)
-        work_dir = tracker.process_image(img_path, tmp_root, mask_path=mask_path)
-        processed_image_paths.append(img_path)
-
-        # collect results
-        smplx = _load_smplx(work_dir)
-        if smplx is not None:
-            smplx_params[img_rel] = smplx
-
-        sap = _load_sapiens(work_dir)
-        if sap is not None:
-            sapiens_poses[img_rel] = sap
-
-        flame = _load_flame(work_dir)
-        if flame is not None:
-            flame_params[img_rel] = flame
-
-        bbox = _load_bbox(work_dir)
-        if bbox is not None:
-            bboxes[img_rel] = bbox
-
-        # copy segmentation mask into subject_output/samurai_seg/
-        seg_src = os.path.join(work_dir, "samurai_seg", "00001.png")
-        if os.path.exists(seg_src):
-            seg_dir = os.path.join(subject_output, "samurai_seg")
-            os.makedirs(seg_dir, exist_ok=True)
-            key_name = img_rel.replace("/", "_").replace(os.sep, "_")
-            shutil.copy2(seg_src, os.path.join(seg_dir, f"{key_name}.png"))
-
-    # save aggregated results
-    if smplx_params:
-        with open(os.path.join(subject_output, "smplx_params.pkl"), "wb") as f:
-            pickle.dump(smplx_params, f)
-
-    if sapiens_poses:
-        np.save(os.path.join(subject_output, "sapiens_pose.npy"), sapiens_poses)
-
-    if flame_params:
-        with open(os.path.join(subject_output, "flame_params.pkl"), "wb") as f:
-            pickle.dump(flame_params, f)
-
-    if bboxes:
-        with open(os.path.join(subject_output, "bbox.pkl"), "wb") as f:
-            pickle.dump(bboxes, f)
-
-    # clean up per-image temp dirs
-    for tmp_root in tmp_roots:
-        if os.path.isdir(tmp_root):
-            shutil.rmtree(tmp_root)
-
-    if visualize and processed_image_paths:
-        tracker.set_visualize(True)
-        viz_work_dir = tracker.process_image_sequence_visualization(
-            processed_image_paths,
-            subject_output,
-        )
-        viz_src = os.path.join(viz_work_dir, "pose_visualized.mp4")
-        if os.path.exists(viz_src):
-            shutil.move(viz_src, os.path.join(subject_output, "pose_visualized.mp4"))
-        shutil.rmtree(viz_work_dir)
-
-    return len(smplx_params)
-
-
-def process_subject_visualization(tracker, input_images, data_root, subject_output):
-    image_paths = []
-    for img_rel in input_images:
-        img_path = os.path.join(data_root, img_rel)
-        if not os.path.exists(img_path):
-            print(f"    [WARN] image not found, skipping visualization: {img_path}")
-            continue
-        image_paths.append(img_path)
-
-    if not image_paths:
-        raise ValueError(f"No valid images available for visualization: {subject_output}")
-
-    tracker.set_visualize(True)
-    viz_work_dir = tracker.process_image_sequence_visualization(
-        image_paths,
-        subject_output,
-    )
-    viz_src = os.path.join(viz_work_dir, "pose_visualized.mp4")
-    if not os.path.exists(viz_src):
-        raise FileNotFoundError(f"Subject visualization missing: {viz_src}")
-    shutil.move(viz_src, os.path.join(subject_output, "pose_visualized.mp4"))
-    shutil.rmtree(viz_work_dir)
-
-
-# ---------------------------------------------------------------------------
 # batch runner helpers
 # ---------------------------------------------------------------------------
 
@@ -280,21 +219,20 @@ class _ImageRecord:
 def _prepare_record(img_path, img_rel, img_idx, subject_output, ds_key, subj_key,
                     skip_folder_check=False):
     """Create per-image workspace and return an _ImageRecord, or None on failure."""
-    mask_path = img_path.replace("/input_images/", "/input_masks/").replace("/images/", "/masks/")
+    _raw_mask_path = img_path.replace("/input_images/", "/input_masks/").replace("/images/", "/masks/")
     tmp_root = os.path.join(subject_output, f"_img_{img_idx:04d}")
     # Derive work_dir unconditionally so resume detection works in both modes.
     work_dir = os.path.join(tmp_root, image_stem(img_path))
 
     if skip_folder_check:
-        found_mask_path = mask_path if mask_path != img_path else None
+        # Always stat the mask to resolve the correct extension (e.g. .png vs .jpg).
+        found_mask_path = _resolve_mask_path(_raw_mask_path, img_path)
     else:
         if not os.path.exists(img_path):
             print(f"    [WARN] image not found, skipping: {img_path}")
             return None
 
-        found_mask_path = None
-        if mask_path != img_path and os.path.exists(mask_path):
-            found_mask_path = mask_path
+        found_mask_path = _resolve_mask_path(_raw_mask_path, img_path)
 
     # Check for a resumable previous run regardless of skip_folder_check.
     sapiens_done = os.path.exists(
@@ -389,7 +327,7 @@ def _aggregate_subject(subj_records, subject_output, visualize, tracker, use_sym
                 f"use_symlink requires skip_samurai=True and a known mask_path, got: {rec.img_rel}"
             )
             os.makedirs(seg_dir, exist_ok=True)
-            if not os.path.exists(seg_dest):
+            if not os.path.lexists(seg_dest):
                 os.symlink(rec.mask_path, seg_dest)
         else:
             seg_src = os.path.join(rec.work_dir, "samurai_seg", "00001.png")
@@ -413,19 +351,18 @@ def _aggregate_subject(subj_records, subject_output, visualize, tracker, use_sym
         with open(os.path.join(subject_output, "bbox.pkl"), "wb") as f:
             pickle.dump(bboxes, f)
 
+    # Visualize before cleanup so per-image work_dirs are still available.
+    if visualize and processed_image_paths:
+        viz_work_dir = tracker.visualize_from_records(subj_records, subject_output)
+        if viz_work_dir:
+            viz_src = os.path.join(viz_work_dir, "pose_visualized.mp4")
+            if os.path.exists(viz_src):
+                shutil.move(viz_src, os.path.join(subject_output, "pose_visualized.mp4"))
+            shutil.rmtree(viz_work_dir)
+
     for rec in subj_records:
         if os.path.isdir(rec.tmp_root):
             shutil.rmtree(rec.tmp_root)
-
-    if visualize and processed_image_paths:
-        tracker.set_visualize(True)
-        viz_work_dir = tracker.process_image_sequence_visualization(
-            processed_image_paths, subject_output,
-        )
-        viz_src = os.path.join(viz_work_dir, "pose_visualized.mp4")
-        if os.path.exists(viz_src):
-            shutil.move(viz_src, os.path.join(subject_output, "pose_visualized.mp4"))
-        shutil.rmtree(viz_work_dir)
 
     return len(smplx_params)
 
@@ -450,7 +387,7 @@ def run_batch(tracker, opt):
     where ``smplx_params.npy`` exists skip video2motion.
 
     Visualisation (smplx render + overlay) is produced for the first
-    ``--n_vis_subjects`` subjects (globally across all datasets).
+    ``--n_vis_subjects`` subjects per dataset.
     Pass ``-1`` to visualise every subject.
 
     With ``--rank R --n_rank N`` only subjects whose global index satisfies
@@ -467,7 +404,6 @@ def run_batch(tracker, opt):
     ds_keys = cfg["data"]["val"].get("ds_keys", [f"ds{i}" for i in range(len(ds_list))])
 
     global_subj_idx = 0
-    viz_count = 0
 
     # -----------------------------------------------------------------------
     # Phase A: collect records and prepare per-image workspaces
@@ -488,6 +424,7 @@ def run_batch(tracker, opt):
         subjects = list(val_list["items"].keys())
         print(f"\n=== Dataset: {ds_key}  ({len(subjects)} subjects) ===")
 
+        ds_viz_count = 0  # reset per dataset
         for ds_subj_idx, subj_key in enumerate(subjects):
             cur_idx = global_subj_idx
             global_subj_idx += 1
@@ -495,9 +432,9 @@ def run_batch(tracker, opt):
             if cur_idx % opt.n_rank != opt.rank:
                 continue
 
-            visualize = opt.n_vis_subjects < 0 or viz_count < opt.n_vis_subjects
+            visualize = opt.n_vis_subjects < 0 or ds_viz_count < opt.n_vis_subjects
             if visualize:
-                viz_count += 1
+                ds_viz_count += 1
 
             subj_dir = subj_key.replace("/", "_").replace(os.sep, "_")
             subject_output = os.path.join(opt.output_path, ds_key, subj_dir)
@@ -579,44 +516,6 @@ def run_batch(tracker, opt):
 
 
 # ---------------------------------------------------------------------------
-# single-image helpers
-# ---------------------------------------------------------------------------
-
-def compare_smplx_json(single_json_path, reference_json_path):
-    print(f"\nComparing results:")
-    print(f"Single: {single_json_path}")
-    print(f"Reference: {reference_json_path}")
-
-    with open(single_json_path, "r") as f:
-        single_data = json.load(f)
-    with open(reference_json_path, "r") as f:
-        ref_data = json.load(f)
-
-    fields = [
-        "betas", "root_pose", "body_pose", "jaw_pose",
-        "lhand_pose", "rhand_pose", "trans", "focal", "princpt",
-    ]
-
-    report = {}
-    for field in fields:
-        if field not in single_data or field not in ref_data:
-            print(f"Field {field} missing in one of the files.")
-            continue
-        s_val = np.array(single_data[field])
-        r_val = np.array(ref_data[field])
-        if s_val.shape != r_val.shape:
-            print(f"Shape mismatch for {field}: {s_val.shape} vs {r_val.shape}")
-            continue
-        diff = np.abs(s_val - r_val)
-        report[field] = {
-            "max_error": float(np.max(diff)),
-            "mean_error": float(np.mean(diff)),
-        }
-        print(f"{field:12}: Max Err = {report[field]['max_error']:.6f}, Mean Err = {report[field]['mean_error']:.6f}")
-    return report
-
-
-# ---------------------------------------------------------------------------
 # argument parser
 # ---------------------------------------------------------------------------
 
@@ -632,8 +531,8 @@ def get_parse():
     # batch-mode options
     parser.add_argument("--sam3dgs_root", type=str, default=None,
                         help="SAM3DGS repo root for resolving relative paths (default: ../../ from this file)")
-    parser.add_argument("--n_vis_subjects", type=int, default=5,
-                        help="Number of subjects (globally) for which to save smplx visualisations; -1 = all")
+    parser.add_argument("--n_vis_subjects", type=int, default=10,
+                        help="Number of subjects per dataset for which to save smplx visualisations; -1 = all")
     parser.add_argument("--rank", type=int, default=0,
                         help="This process rank for multi-process splitting (0-indexed)")
     parser.add_argument("--n_rank", type=int, default=1,
@@ -654,10 +553,6 @@ def get_parse():
                         help="Skip os.path.exists checks during record preparation (assumes images and masks exist)")
     parser.add_argument("--sapiens_chunk_size", type=int, default=500,
                         help="Max images per sapiens subprocess call to avoid OOM (default: 500)")
-
-    # single-image-only options
-    parser.add_argument("--compare_json", type=str, default=None,
-                        help="Reference SMPL-X JSON to compare against (single-image mode)")
 
     args = parser.parse_args()
     return args
@@ -688,9 +583,3 @@ if __name__ == "__main__":
         print(f"Finish processing image: {opt.image_path}")
         print(f"Output: {work_dir}")
 
-        if opt.compare_json:
-            single_json = os.path.join(work_dir, "smplx_params", "00001.json")
-            if os.path.exists(single_json):
-                compare_smplx_json(single_json, opt.compare_json)
-            else:
-                print(f"Error: result not found at {single_json}")
