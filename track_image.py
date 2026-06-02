@@ -35,6 +35,7 @@ class ImageTracker(BaseTracker):
             kp_mode="sapiens",
             track_mode="samurai",
             is_smooth=False,
+            is_smooth_fitting=False,
             pad_ratio=self.opt.pad_ratio,
             min_track_len=1,
             visualize=self.opt.visualize,
